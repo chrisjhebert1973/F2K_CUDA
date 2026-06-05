@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
     std::string decode_latent_path;   // isolation: decode a ground-truth latent
     uint32_t seed = 0xCAFEBABEu;
     int n_steps = 4;
+    int res = 256;   // output image resolution (square); latent = res/8
     f2k::cuda::Precision precision = f2k::cuda::Precision::NVFP4;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -76,6 +77,7 @@ int main(int argc, char** argv) {
         else if (a == "--out"    && i + 1 < argc) out_path    = argv[++i];
         else if (a == "--seed"   && i + 1 < argc) seed = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (a == "--steps"  && i + 1 < argc) n_steps = std::stoi(argv[++i]);
+        else if (a == "--res"    && i + 1 < argc) res = std::stoi(argv[++i]);
         else if (a == "--decode_latent" && i + 1 < argc) decode_latent_path = argv[++i];
         else if (a == "--precision" && i + 1 < argc) {
             std::string p = argv[++i];
@@ -131,11 +133,21 @@ int main(int argc, char** argv) {
     // ============================================================
     // 2. Configure shapes
     // ============================================================
-    // 32×32 latent → 16×16 patch grid (p=2) → seq_img=256 → 256×256 image.
-    constexpr int H_LAT = 32, W_LAT = 32, PATCH = 2;
-    constexpr int SEQ_IMG = (H_LAT / PATCH) * (W_LAT / PATCH);    // 256
+    // res×res image → (res/8)² latent → patch grid (p=2) → seq_img.
+    // e.g. 256 → 32×32 latent → 16×16 grid → seq_img=256;
+    //     1024 → 128×128 latent → 64×64 grid → seq_img=4096.
+    constexpr int PATCH = 2;
+    const int H_LAT = res / 8, W_LAT = res / 8;
+    const int SEQ_IMG = (H_LAT / PATCH) * (W_LAT / PATCH);
+    const int H_PATCH = H_LAT / PATCH, W_PATCH = W_LAT / PATCH;
     constexpr int SEQ_TXT = 512;  // diffusers Flux2 max_sequence_length default
     constexpr int IN_CH   = PATCH * PATCH * 32;                   // 128
+    if (res % 16 != 0 || (SEQ_IMG % 128) != 0) {
+        std::fprintf(stderr, "--res %d invalid: need res%%16==0 and seq_img(%d)%%128==0\n",
+                     res, SEQ_IMG); return 1;
+    }
+    std::printf("Resolution:    %dx%d  (latent %dx%d, seq_img=%d)\n",
+                res, res, H_LAT, W_LAT, SEQ_IMG);
     constexpr int T5_DIM  = 12288;
     constexpr int TIME_DIM = 256;
     constexpr int N_HEADS = 32, HEAD_DIM = 128;
@@ -145,6 +157,7 @@ int main(int argc, char** argv) {
 
     f2k::cuda::FluxTransformer::Config tcfg{};
     tcfg.batch = 1; tcfg.seq_img = SEQ_IMG; tcfg.seq_txt = SEQ_TXT;
+    tcfg.H_patches = H_PATCH; tcfg.W_patches = W_PATCH;
     tcfg.in_channels = IN_CH; tcfg.t5_dim = T5_DIM; tcfg.time_dim = TIME_DIM;
     tcfg.n_heads = N_HEADS; tcfg.head_dim = HEAD_DIM; tcfg.ffn_dim = FFN_DIM;
     tcfg.num_double_blocks = N_DOUBLE; tcfg.num_single_blocks = N_SINGLE;

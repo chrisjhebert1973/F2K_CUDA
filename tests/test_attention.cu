@@ -110,6 +110,8 @@ int main() {
     ok &= run_case(2, 128, 4, 128);
     ok &= run_case(1, 512, 8, 128);
     ok &= run_case(1, 1024, 4, 128);
+    ok &= run_case(1, 130,  2, 128);   // S not a multiple of the K-tile
+    ok &= run_case(1, 1024, 1, 512);   // VAE-style: 1 head, head_dim=512
     std::printf("%s\n", ok ? "ALL OK" : "FAILURES");
     return ok ? 0 : 1;
 }
