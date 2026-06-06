@@ -1,9 +1,11 @@
-// Self-attention v1 — row-at-a-time fused kernel.
+// Self-attention: row-at-a-time fallback + a WMMA flash kernel (tensor-core
+// QK^T and P@V) for head_dim 128.
 
 #include "backend/cuda/attention.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cmath>
 #include <cstdint>
@@ -217,6 +219,166 @@ __global__ void flash_attn_kernel(const __nv_bfloat16* __restrict__ Q,
     }
 }
 
+// ---------------------------------------------------------------------------
+// WMMA flash-attention kernel (FlashAttention-2 style) for head_dim D.
+// 4 warps/CTA; each warp owns 16 query rows, so BM = 64 queries share each
+// K/V tile load — 8× less K/V HBM traffic than the warp-per-query kernel above
+// (the dominant cost: that kernel re-reads all K/V from HBM once per 8 queries).
+// QK^T and P@V run on tensor cores (bf16 mma, fp32 accumulate); the online
+// softmax keeps per-row (m, l) and rescales the fp32 O accumulator in smem.
+// Instantiated for D=128 (the transformer); other dims use the kernels above.
+// ---------------------------------------------------------------------------
+using namespace nvcuda;
+
+template <int D>
+__global__ void flash_wmma_kernel(const __nv_bfloat16* __restrict__ Q,
+                                  const __nv_bfloat16* __restrict__ K,
+                                  const __nv_bfloat16* __restrict__ V,
+                                  __nv_bfloat16* __restrict__ O,
+                                  int B, int S, int H, float scale) {
+    constexpr int BN = 48;          // keys per K/V tile (3 WMMA tiles; 48 fits
+                                    // GB10's 99 KiB smem cap, BN=64 doesn't)
+    constexpr int WARPS = 4;
+    constexpr int BM = WARPS * 16;  // 64 queries per CTA (drives K/V reuse)
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int q0 = blockIdx.x * BM + warp * 16;  // first query of this warp
+    const int h  = blockIdx.y;
+    const int b  = blockIdx.z;
+
+    extern __shared__ uint8_t smem[];
+    __nv_bfloat16* Ks = reinterpret_cast<__nv_bfloat16*>(smem);  // [BN][D]
+    __nv_bfloat16* Vs = Ks + BN * D;                             // [BN][D]
+    __nv_bfloat16* Qs = Vs + BN * D;                             // [BM][D]
+    __nv_bfloat16* Ps = Qs + BM * D;                             // [BM][BN]
+    float* Ss = reinterpret_cast<float*>(Ps + BM * BN);          // [BM][BN]
+    float* Os = Ss + BM * BN;                                    // [BM][D]
+    float* Ms = Os + BM * D;                                     // [BM]
+    float* Ls = Ms + BM;                                         // [BM]
+    float* Cm = Ls + BM;                                         // [BM] per-row new max
+    float* Cc = Cm + BM;                                         // [BM] per-row rescale
+
+    __nv_bfloat16* qW = Qs + warp * 16 * D;
+    __nv_bfloat16* pW = Ps + warp * 16 * BN;
+    float* sW = Ss + warp * 16 * BN;
+    float* oW = Os + warp * 16 * D;
+    float* mW = Ms + warp * 16;
+    float* lW = Ls + warp * 16;
+    float* cmW = Cm + warp * 16;
+    float* ccW = Cc + warp * 16;
+
+    // Init O=0, m=-inf, l=0; load this warp's Q rows (zero-pad past S).
+    for (int i = lane; i < 16 * D; i += 32) oW[i] = 0.0f;
+    for (int i = lane; i < 16;     i += 32) { mW[i] = -INFINITY; lW[i] = 0.0f; }
+    for (int i = lane; i < 16 * D; i += 32) {
+        const int r = i / D, d = i % D, qq = q0 + r;
+        qW[i] = (qq < S) ? Q[(((size_t)b * S + qq) * H + h) * D + d]
+                         : __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> qfrag[D / 16];
+    #pragma unroll
+    for (int kt = 0; kt < D / 16; ++kt) wmma::load_matrix_sync(qfrag[kt], qW + kt * 16, D);
+
+    for (int k0 = 0; k0 < S; k0 += BN) {
+        // Cooperative K/V tile load (all warps), zero-pad past S.
+        for (int i = threadIdx.x; i < BN * D; i += blockDim.x) {
+            const int n = i / D, d = i % D, kk = k0 + n;
+            __nv_bfloat16 kv = __float2bfloat16(0.0f), vv = kv;
+            if (kk < S) { const size_t off = (((size_t)b * S + kk) * H + h) * D + d; kv = K[off]; vv = V[off]; }
+            Ks[i] = kv; Vs[i] = vv;
+        }
+        __syncthreads();
+
+        // S = Q @ K^T  →  sW[16][BN] (fp32). K stored [BN][D] row-major is read
+        // as col_major [D][BN] to get K^T.
+        #pragma unroll
+        for (int nt = 0; nt < BN / 16; ++nt) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int kt = 0; kt < D / 16; ++kt) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> kf;
+                wmma::load_matrix_sync(kf, Ks + nt * 16 * D + kt * 16, D);
+                wmma::mma_sync(acc, qfrag[kt], kf, acc);
+            }
+            wmma::store_matrix_sync(sW + nt * 16, acc, BN, wmma::mem_row_major);
+        }
+        __syncwarp();
+
+        // Online softmax. The per-row reductions (max, sum) stay on the 16
+        // row-owning lanes, but the heavy elementwise work (exp over 16×BN, the
+        // D-wide O rescale, and the PV add-back) is spread across all 32 lanes
+        // via flat indexing — that epilogue, not the matmul, was the bottleneck.
+        const int valid = min(BN, S - k0);
+        // Phase 1 (16 lanes): scale scores, row max, store mnew + rescale corr.
+        if (lane < 16) {
+            const int r = lane;
+            float* srow = sW + r * BN;
+            float rmax = -INFINITY;
+            for (int j = 0; j < BN; ++j) {
+                const float v = (j < valid) ? srow[j] * scale : -INFINITY;
+                srow[j] = v; rmax = fmaxf(rmax, v);
+            }
+            const float mold = mW[r], mnew = fmaxf(mold, rmax);
+            cmW[r] = mnew; ccW[r] = __expf(mold - mnew); mW[r] = mnew;
+        }
+        __syncwarp();
+        // Phase 2 (32 lanes): exp into pW (bf16) and sW (fp32, for the sum).
+        for (int i = lane; i < 16 * BN; i += 32) {
+            const int r = i / BN;
+            const float p = __expf(sW[i] - cmW[r]);
+            sW[i] = p; pW[i] = __float2bfloat16(p);
+        }
+        __syncwarp();
+        // Phase 3 (16 lanes): row sum → update l (rescaled by corr).
+        if (lane < 16) {
+            const int r = lane; float s = 0.0f;
+            for (int j = 0; j < BN; ++j) s += sW[r * BN + j];
+            lW[r] = lW[r] * ccW[r] + s;
+        }
+        // Phase 4 (32 lanes): rescale the running O accumulator by corr.
+        for (int i = lane; i < 16 * D; i += 32) oW[i] *= ccW[i / D];
+        __syncthreads();
+
+        // O += P @ V. Per [16,16] tile: WMMA into a fragment, store to scratch,
+        // add into the fp32 O with all 32 lanes (256 elems → 8 iters/lane).
+        #pragma unroll
+        for (int nt = 0; nt < D / 16; ++nt) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int kt = 0; kt < BN / 16; ++kt) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vf;
+                wmma::load_matrix_sync(pf, pW + kt * 16, BN);
+                wmma::load_matrix_sync(vf, Vs + kt * 16 * D + nt * 16, D);
+                wmma::mma_sync(acc, pf, vf, acc);
+            }
+            __syncwarp();
+            wmma::store_matrix_sync(sW, acc, 16, wmma::mem_row_major);  // scratch [16][16]
+            __syncwarp();
+            for (int i = lane; i < 16 * 16; i += 32) {
+                const int r = i >> 4, c = i & 15;
+                oW[r * D + nt * 16 + c] += sW[i];
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+
+    // O = O / l for valid query rows (all 32 lanes, flat over 16×D).
+    for (int i = lane; i < 16 * D; i += 32) {
+        const int r = i / D, d = i % D, qq = q0 + r;
+        if (qq < S) {
+            const float inv = 1.0f / (lW[r] + 1e-30f);
+            O[(((size_t)b * S + qq) * H + h) * D + d] = __float2bfloat16(oW[i] * inv);
+        }
+    }
+}
+
 } // anonymous namespace
 
 namespace f2k::cuda {
@@ -277,6 +439,27 @@ bool launch_flash(const void* Q, const void* K, const void* V, void* O,
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+template <int D>
+bool launch_wmma(const void* Q, const void* K, const void* V, void* O,
+                 int B, int S, int H, float scale, const char*& err,
+                 cudaStream_t stream) {
+    constexpr int BN = 48, WARPS = 4, BM = WARPS * 16;
+    const int block = WARPS * 32;
+    // smem: Ks+Vs+Qs+Ps (bf16) | Ss+Os+Ms+Ls+Cm+Cc (fp32)
+    const size_t smem =
+        (static_cast<size_t>(BN) * D + BN * D + BM * D + BM * BN) * sizeof(__nv_bfloat16) +
+        (static_cast<size_t>(BM) * BN + BM * D + 4 * BM) * sizeof(float);
+    if (!ensure_dynamic_smem(flash_wmma_kernel<D>, smem, err)) return false;
+    dim3 grid((S + BM - 1) / BM, H, B);
+    flash_wmma_kernel<D><<<grid, block, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(Q),
+        static_cast<const __nv_bfloat16*>(K),
+        static_cast<const __nv_bfloat16*>(V),
+        static_cast<      __nv_bfloat16*>(O),
+        B, S, H, scale);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 } // anonymous namespace
 
 bool Attention::forward(const void* Q, const void* K, const void* V,
@@ -284,13 +467,16 @@ bool Attention::forward(const void* Q, const void* K, const void* V,
     if (!valid_) return false;
     const int B = cfg_.batch, S = cfg_.seq, H = cfg_.n_heads, D = cfg_.head_dim;
 
-    // Flash path for head dims that divide into 32-lane chunks (covers the
-    // transformer's D=128 and the VAE's D=512). Falls back to the row kernel
-    // for other dims.
+    // D=128 (the transformer) uses the WMMA flash kernel: tensor-core QK^T/P@V
+    // and BM=64 queries/CTA → 8× less K/V HBM traffic. Other 32-divisible dims
+    // (incl. the VAE's D=512, whose smem is too large for the WMMA tiling) use
+    // the warp-per-query flash kernel; everything else uses the row kernel.
+    if (D == 128) {
+        return launch_wmma<128>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream);
+    }
     if (D % 32 == 0) {
         switch (D / 32) {
             case 2:  return launch_flash<2>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream);  // D=64
-            case 4:  return launch_flash<4>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream);  // D=128
             case 8:  return launch_flash<8>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream);  // D=256
             case 16: return launch_flash<16>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream); // D=512
             default: break;  // fall through to row kernel
