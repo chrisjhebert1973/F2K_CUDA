@@ -128,9 +128,17 @@ target_compile_options(f2k PRIVATE
 
 # When CUDA is enabled, the backend lib will pull in CUTLASS + cuBLAS + cuDNN.
 if(F2K_ENABLE_CUDA)
-    # cuDNN — for the VAE decoder convs and norms. Apt-installed cuDNN 9 headers
-    # live under /usr/include/aarch64-linux-gnu (Debian/Ubuntu multiarch path).
-    find_library(CUDNN_LIB cudnn HINTS /usr/lib/aarch64-linux-gnu)
+    # cuDNN — for the VAE decoder convs and norms. The Blackwell (sm_121)
+    # tensor-core conv engines only exist in cuDNN 9 and are reachable only via
+    # the backend graph API (see conv2d.cu). The unversioned `libcudnn.so` dev
+    # symlink points at the legacy cuDNN 8 (no sm_121 kernels — ~170x slower),
+    # so we link libcudnn.so.9 explicitly. Headers in /usr/include are already
+    # v9 (cudnn_version.h reports CUDNN_MAJOR 9).
+    find_library(CUDNN_LIB NAMES cudnn.so.9 libcudnn.so.9 cudnn
+                 HINTS /usr/lib/aarch64-linux-gnu)
+    if(EXISTS /usr/lib/aarch64-linux-gnu/libcudnn.so.9)
+        set(CUDNN_LIB /usr/lib/aarch64-linux-gnu/libcudnn.so.9)
+    endif()
     if(NOT CUDNN_LIB)
         message(FATAL_ERROR "cuDNN not found. Install libcudnn9-cuda-13 + libcudnn9-dev-cuda-13.")
     endif()
