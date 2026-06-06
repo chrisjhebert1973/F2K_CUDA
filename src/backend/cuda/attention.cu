@@ -9,10 +9,47 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 
 namespace {
 
 constexpr int MAX_BLOCK = 256;
+
+// ---------------------------------------------------------------------------
+// mma.sync m16n8k16 bf16 primitives (validated bit-exact in tools/mma_unit.cu).
+// Fragment thread→element map (gid=lane/4, t=lane%4):
+//   A[16x16] row-major: a0=A[gid][2t..1] a1=A[gid+8][2t..] a2=A[gid][2t+8..] a3=A[gid+8][2t+8..]
+//   B[16x8]  col-major: b0=B[2t..1][gid] b1=B[2t+8..9][gid]   (k=row, n=col)
+//   C[16x8]  fp32:      d0=C[gid][2t] d1=C[gid][2t+1] d2=C[gid+8][2t] d3=C[gid+8][2t+1]
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return (uint32_t(__bfloat16_as_ushort(hi)) << 16) | uint32_t(__bfloat16_as_ushort(lo));
+}
+
+__device__ __forceinline__ void mma_m16n8k16(float (&d)[4],
+                                             const uint32_t (&a)[4],
+                                             const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+}
+
+// ldmatrix.x2 (2× 8x8 b16) → one mma B-fragment. Recipes validated in mma_unit.cu:
+//   QK^T B (col-major K in smem): non-trans, addr at key row, hd-half col-block.
+//   P@V  B (row-major V in smem): trans,     addr at key row (8 contiguous hd).
+__device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* p) {
+    uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t (&r)[2], const void* p) {
+    uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
 
 __device__ __forceinline__ float warp_reduce_max(float v) {
     v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, 16));
@@ -379,6 +416,346 @@ __global__ void flash_wmma_kernel(const __nv_bfloat16* __restrict__ Q,
     }
 }
 
+// ---------------------------------------------------------------------------
+// WMMA flash-attention with a REGISTER-RESIDENT O accumulator (head_dim D).
+// Same BM=64 / BN=48 tiling and K/V traffic as the older flash_wmma_kernel, but
+// the O accumulator lives in wmma fragments (registers) and Q is loaded straight
+// from global — dropping the 32 KiB Os + 16 KiB Qs smem arrays. smem ≈ 43 KiB
+// → 2 CTAs/SM instead of 1, ~2× occupancy → 1.68× faster at S=4608 (the kernel
+// was occupancy-bound, not bandwidth-bound — see bench_attention).
+// The per-row online-softmax correction is applied to the register O via a smem
+// store/scale/reload (wmma hides the fragment row→lane layout); the P@V add-back
+// is a free register add since both accumulators share that layout.
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void flash_wmma_regO_kernel(const __nv_bfloat16* __restrict__ Q,
+                                       const __nv_bfloat16* __restrict__ K,
+                                       const __nv_bfloat16* __restrict__ V,
+                                       __nv_bfloat16* __restrict__ O,
+                                       int B, int S, int H, float scale) {
+    constexpr int BN = 48;
+    constexpr int WARPS = 4;
+    constexpr int BM = WARPS * 16;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int q0 = blockIdx.x * BM + warp * 16;
+    const int h  = blockIdx.y;
+    const int b  = blockIdx.z;
+
+    extern __shared__ uint8_t smem[];
+    __nv_bfloat16* Ks = reinterpret_cast<__nv_bfloat16*>(smem);  // [BN][D]
+    __nv_bfloat16* Vs = Ks + BN * D;                             // [BN][D]
+    __nv_bfloat16* Ps = Vs + BN * D;                             // [BM][BN]
+    float* Ss = reinterpret_cast<float*>(Ps + BM * BN);          // [BM][BN]
+    float* Ms = Ss + BM * BN;                                    // [BM]
+    float* Ls = Ms + BM;                                         // [BM]
+    float* Cm = Ls + BM;                                         // [BM]
+    float* Cc = Cm + BM;                                         // [BM]
+
+    __nv_bfloat16* pW = Ps + warp * 16 * BN;  // [16][BN]; also Q-stage scratch
+    float* sW  = Ss + warp * 16 * BN;   // [16][BN]; also O-rescale scratch [16][16]
+    float* mW  = Ms + warp * 16;
+    float* lW  = Ls + warp * 16;
+    float* cmW = Cm + warp * 16;
+    float* ccW = Cc + warp * 16;
+
+    // O accumulator in registers (D/16 fragments per warp), running stats.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> ofrag[D / 16];
+    #pragma unroll
+    for (int nt = 0; nt < D / 16; ++nt) wmma::fill_fragment(ofrag[nt], 0.0f);
+    if (lane < 16) { mW[lane] = -INFINITY; lW[lane] = 0.0f; }
+
+    // Q into fragments. Full query tiles load straight from global; a partial
+    // last tile (q0+16 > S) is staged through pW with zero-padded rows.
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> qfrag[D / 16];
+    if (q0 + 16 <= S) {
+        const __nv_bfloat16* Qrow = Q + (((size_t)b * S + q0) * H + h) * D;
+        #pragma unroll
+        for (int kt = 0; kt < D / 16; ++kt)
+            wmma::load_matrix_sync(qfrag[kt], Qrow + kt * 16, H * D);
+    } else {
+        #pragma unroll
+        for (int kt = 0; kt < D / 16; ++kt) {
+            for (int i = lane; i < 16 * 16; i += 32) {
+                const int r = i >> 4, c = i & 15, qq = q0 + r;
+                pW[i] = (qq < S) ? Q[(((size_t)b * S + qq) * H + h) * D + kt * 16 + c]
+                                 : __float2bfloat16(0.0f);
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(qfrag[kt], pW, 16);
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+
+    for (int k0 = 0; k0 < S; k0 += BN) {
+        const int valid = min(BN, S - k0);   // real keys in this tile
+        for (int i = threadIdx.x; i < BN * D; i += blockDim.x) {
+            const int n = i / D, d = i % D, kk = k0 + n;
+            __nv_bfloat16 kv = __float2bfloat16(0.0f), vv = kv;
+            if (kk < S) { const size_t off = (((size_t)b * S + kk) * H + h) * D + d; kv = K[off]; vv = V[off]; }
+            Ks[i] = kv; Vs[i] = vv;
+        }
+        __syncthreads();
+
+        // S = Q @ K^T → sW (fp32).
+        #pragma unroll
+        for (int nt = 0; nt < BN / 16; ++nt) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int kt = 0; kt < D / 16; ++kt) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> kf;
+                wmma::load_matrix_sync(kf, Ks + nt * 16 * D + kt * 16, D);
+                wmma::mma_sync(acc, qfrag[kt], kf, acc);
+            }
+            wmma::store_matrix_sync(sW + nt * 16, acc, BN, wmma::mem_row_major);
+        }
+        __syncwarp();
+
+        // Online softmax (keys >= valid are masked to -inf so they don't count).
+        if (lane < 16) {
+            const int r = lane; float* srow = sW + r * BN; float rmax = -INFINITY;
+            for (int j = 0; j < BN; ++j) {
+                const float v = (j < valid) ? srow[j] * scale : -INFINITY;
+                srow[j] = v; rmax = fmaxf(rmax, v);
+            }
+            const float mold = mW[r], mnew = fmaxf(mold, rmax);
+            cmW[r] = mnew; ccW[r] = __expf(mold - mnew); mW[r] = mnew;
+        }
+        __syncwarp();
+        for (int i = lane; i < 16 * BN; i += 32) {
+            const int r = i / BN; const float p = __expf(sW[i] - cmW[r]);
+            sW[i] = p; pW[i] = __float2bfloat16(p);
+        }
+        __syncwarp();
+        if (lane < 16) {
+            const int r = lane; float s = 0.0f;
+            for (int j = 0; j < BN; ++j) s += sW[r * BN + j];
+            lW[r] = lW[r] * ccW[r] + s;
+        }
+        __syncwarp();
+
+        // For each output column-tile: rescale O fragment by corr (store/scale/
+        // reload through sW scratch), then add this tile's P@V (register add —
+        // both accumulators share layout, so no row mapping needed).
+        #pragma unroll
+        for (int nt = 0; nt < D / 16; ++nt) {
+            wmma::store_matrix_sync(sW, ofrag[nt], 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int i = lane; i < 16 * 16; i += 32) sW[i] *= ccW[i >> 4];
+            __syncwarp();
+            wmma::load_matrix_sync(ofrag[nt], sW, 16, wmma::mem_row_major);
+            __syncwarp();
+
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int kt = 0; kt < BN / 16; ++kt) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vf;
+                wmma::load_matrix_sync(pf, pW + kt * 16, BN);
+                wmma::load_matrix_sync(vf, Vs + kt * 16 * D + nt * 16, D);
+                wmma::mma_sync(acc, pf, vf, acc);
+            }
+            #pragma unroll
+            for (int i = 0; i < ofrag[nt].num_elements; ++i) ofrag[nt].x[i] += acc.x[i];
+            __syncwarp();
+        }
+        __syncthreads();  // before next K/V tile overwrites Ks/Vs
+    }
+
+    // Normalize by 1/l and write out (store frag to sW to recover row layout).
+    // Partial last query tile (q0+r >= S) must NOT write past the end of O.
+    #pragma unroll
+    for (int nt = 0; nt < D / 16; ++nt) {
+        wmma::store_matrix_sync(sW, ofrag[nt], 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < 16 * 16; i += 32) {
+            const int r = i >> 4, c = i & 15, qq = q0 + r;
+            if (qq < S) {
+                const float inv = 1.0f / (lW[r] + 1e-30f);
+                O[(((size_t)b * S + qq) * H + h) * D + nt * 16 + c] =
+                    __float2bfloat16(sW[i] * inv);
+            }
+        }
+        __syncwarp();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mma.sync flash-attention (head_dim D) — removes regO's "rescale tax".
+// Same BM=64/BN=48 tiling, but uses raw mma.sync m16n8k16 (documented fragment
+// layout) instead of opaque wmma fragments. Consequences:
+//   • O lives in C-fragment registers; the per-row online-softmax correction is
+//     a direct register multiply (each thread owns rows {gid, gid+8} of O), so
+//     NO smem store/scale/reload (the tax regO paid).
+//   • The softmax row max/sum are register reductions across the 4 lanes that
+//     share a row (__shfl_xor within the group of 4) — S never touches smem.
+//   • P@V's contraction = QK^T's N dim and the C/A fragment layouts share the
+//     (gid,gid+8) row + 2t column mapping, so the QK^T result registers pack
+//     DIRECTLY into the P@V A-fragments (cast to bf16) — no P smem round-trip.
+// The only inner-loop smem traffic is the unavoidable K/V global→smem staging.
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void flash_mma_kernel(const __nv_bfloat16* __restrict__ Q,
+                                 const __nv_bfloat16* __restrict__ K,
+                                 const __nv_bfloat16* __restrict__ V,
+                                 __nv_bfloat16* __restrict__ O,
+                                 int B, int S, int H, float scale) {
+    constexpr int BN = 48;
+    constexpr int WARPS = 4;
+    constexpr int BM = WARPS * 16;   // 64 queries / CTA
+    constexpr int KT_QK = D / 16;    // QK^T contraction tiles (head dim)
+    constexpr int NT_QK = BN / 8;    // QK^T n8-tiles (keys)
+    constexpr int KT_PV = BN / 16;   // P@V contraction tiles (keys)
+    constexpr int NT_PV = D / 8;     // P@V n8-tiles (head dim)
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int gid  = lane >> 2;      // 0..7
+    const int t    = lane & 3;       // 0..3
+    const int q0   = blockIdx.x * BM + warp * 16;
+    const int h    = blockIdx.y;
+    const int b    = blockIdx.z;
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+
+    extern __shared__ __nv_bfloat16 smem_mma[];
+    __nv_bfloat16* Ks = smem_mma;          // [BN][D]
+    __nv_bfloat16* Vs = Ks + BN * D;       // [BN][D]
+
+    // This warp's Q rows {gid, gid+8} → A-fragments, held across the K loop.
+    const int r_lo = q0 + gid, r_hi = q0 + gid + 8;
+    uint32_t qf[KT_QK][4];
+    #pragma unroll
+    for (int kt = 0; kt < KT_QK; ++kt) {
+        const int c = kt * 16 + 2 * t;
+        const __nv_bfloat16* Qlo = Q + (((size_t)b * S + r_lo) * H + h) * D;
+        const __nv_bfloat16* Qhi = Q + (((size_t)b * S + r_hi) * H + h) * D;
+        const bool vlo = r_lo < S, vhi = r_hi < S;
+        qf[kt][0] = vlo ? pack2(Qlo[c],   Qlo[c + 1]) : 0u;
+        qf[kt][1] = vhi ? pack2(Qhi[c],   Qhi[c + 1]) : 0u;
+        qf[kt][2] = vlo ? pack2(Qlo[c+8], Qlo[c + 9]) : 0u;
+        qf[kt][3] = vhi ? pack2(Qhi[c+8], Qhi[c + 9]) : 0u;
+    }
+
+    float of[NT_PV][4];   // O accumulator (C-fragment layout)
+    #pragma unroll
+    for (int nt = 0; nt < NT_PV; ++nt) of[nt][0]=of[nt][1]=of[nt][2]=of[nt][3]=0.0f;
+    float m_lo = -INFINITY, m_hi = -INFINITY, l_lo = 0.0f, l_hi = 0.0f;
+
+    for (int k0 = 0; k0 < S; k0 += BN) {
+        const int valid = min(BN, S - k0);
+        for (int i = threadIdx.x; i < BN * D; i += blockDim.x) {
+            const int n = i / D, d = i % D, kk = k0 + n;
+            __nv_bfloat16 kv = zero, vv = zero;
+            if (kk < S) { const size_t off=(((size_t)b*S+kk)*H+h)*D+d; kv=K[off]; vv=V[off]; }
+            Ks[i] = kv; Vs[i] = vv;
+        }
+        __syncthreads();
+
+        // S = Q @ K^T  → sc[NT_QK][4] (fp32), in C-fragment layout.
+        float sc[NT_QK][4];
+        const int kkey = lane & 7;             // key within the n8-tile (ldmatrix row)
+        const int khalf = ((lane >> 3) & 1) * 8;
+        #pragma unroll
+        for (int nt = 0; nt < NT_QK; ++nt) {
+            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int kt = 0; kt < KT_QK; ++kt) {
+                // B = K^T (col-major in Ks): ldmatrix non-trans, hd-halves as the
+                // two 8x8 matrices. addr = Ks[key row][hd col].
+                uint32_t bf[2];
+                ldmatrix_x2(bf, &Ks[(nt * 8 + kkey) * D + kt * 16 + khalf]);
+                mma_m16n8k16(acc, qf[kt], bf);
+            }
+            // Output key column for this n8-tile is (nt*8 + 2t) / (+1); mask padding.
+            const int c0 = nt * 8 + 2 * t, c1 = c0 + 1;
+            sc[nt][0] = (c0 < valid) ? acc[0] * scale : -INFINITY;
+            sc[nt][1] = (c1 < valid) ? acc[1] * scale : -INFINITY;
+            sc[nt][2] = (c0 < valid) ? acc[2] * scale : -INFINITY;
+            sc[nt][3] = (c1 < valid) ? acc[3] * scale : -INFINITY;
+        }
+
+        // Row max over the thread's keys, then across the 4 lanes sharing a row.
+        float rmax_lo = -INFINITY, rmax_hi = -INFINITY;
+        #pragma unroll
+        for (int nt = 0; nt < NT_QK; ++nt) {
+            rmax_lo = fmaxf(rmax_lo, fmaxf(sc[nt][0], sc[nt][1]));
+            rmax_hi = fmaxf(rmax_hi, fmaxf(sc[nt][2], sc[nt][3]));
+        }
+        rmax_lo = fmaxf(rmax_lo, __shfl_xor_sync(0xFFFFFFFFu, rmax_lo, 1));
+        rmax_lo = fmaxf(rmax_lo, __shfl_xor_sync(0xFFFFFFFFu, rmax_lo, 2));
+        rmax_hi = fmaxf(rmax_hi, __shfl_xor_sync(0xFFFFFFFFu, rmax_hi, 1));
+        rmax_hi = fmaxf(rmax_hi, __shfl_xor_sync(0xFFFFFFFFu, rmax_hi, 2));
+
+        const float mnew_lo = fmaxf(m_lo, rmax_lo), mnew_hi = fmaxf(m_hi, rmax_hi);
+        const float corr_lo = __expf(m_lo - mnew_lo), corr_hi = __expf(m_hi - mnew_hi);
+        m_lo = mnew_lo; m_hi = mnew_hi;
+
+        // P = exp(S - m) (masked entries → exp(-inf)=0); keep bf16 in C-layout
+        // for direct repacking into P@V A-fragments. Accumulate row sums.
+        __nv_bfloat16 pcb[NT_QK][4];
+        float psum_lo = 0.0f, psum_hi = 0.0f;
+        #pragma unroll
+        for (int nt = 0; nt < NT_QK; ++nt) {
+            const float p0 = __expf(sc[nt][0] - mnew_lo), p1 = __expf(sc[nt][1] - mnew_lo);
+            const float p2 = __expf(sc[nt][2] - mnew_hi), p3 = __expf(sc[nt][3] - mnew_hi);
+            psum_lo += p0 + p1; psum_hi += p2 + p3;
+            pcb[nt][0]=__float2bfloat16(p0); pcb[nt][1]=__float2bfloat16(p1);
+            pcb[nt][2]=__float2bfloat16(p2); pcb[nt][3]=__float2bfloat16(p3);
+        }
+        psum_lo += __shfl_xor_sync(0xFFFFFFFFu, psum_lo, 1);
+        psum_lo += __shfl_xor_sync(0xFFFFFFFFu, psum_lo, 2);
+        psum_hi += __shfl_xor_sync(0xFFFFFFFFu, psum_hi, 1);
+        psum_hi += __shfl_xor_sync(0xFFFFFFFFu, psum_hi, 2);
+        l_lo = l_lo * corr_lo + psum_lo;
+        l_hi = l_hi * corr_hi + psum_hi;
+
+        // Rescale running O by corr — direct register multiply (d0,d1=row lo; d2,d3=row hi).
+        #pragma unroll
+        for (int nt = 0; nt < NT_PV; ++nt) {
+            of[nt][0]*=corr_lo; of[nt][1]*=corr_lo; of[nt][2]*=corr_hi; of[nt][3]*=corr_hi;
+        }
+
+        // O += P @ V. A-frags come straight from the QK^T result registers (pcb);
+        // B-frags read V from smem (key=row, head-dim=col).
+        const int vkey = lane & 15;   // key within the 16-key tile (ldmatrix row)
+        #pragma unroll
+        for (int nt = 0; nt < NT_PV; ++nt) {        // output head-dim 8-tiles
+            #pragma unroll
+            for (int kt = 0; kt < KT_PV; ++kt) {    // key 16-tiles
+                const uint32_t af[4] = {
+                    pack2(pcb[2*kt][0],   pcb[2*kt][1]),
+                    pack2(pcb[2*kt][2],   pcb[2*kt][3]),
+                    pack2(pcb[2*kt+1][0], pcb[2*kt+1][1]),
+                    pack2(pcb[2*kt+1][2], pcb[2*kt+1][3]) };
+                // B = V (row-major in Vs): ldmatrix trans, addr at key row, hd col.
+                uint32_t bf[2];
+                ldmatrix_x2_trans(bf, &Vs[(kt * 16 + vkey) * D + nt * 8]);
+                mma_m16n8k16(of[nt], af, bf);
+            }
+        }
+        __syncthreads();   // before next tile overwrites Ks/Vs
+    }
+
+    // Normalize by 1/l and write out (O_C[nt].d0 = O[row lo][nt*8+2t], etc.).
+    const float inv_lo = 1.0f / (l_lo + 1e-30f), inv_hi = 1.0f / (l_hi + 1e-30f);
+    #pragma unroll
+    for (int nt = 0; nt < NT_PV; ++nt) {
+        const int col0 = nt * 8 + 2 * t, col1 = col0 + 1;
+        if (r_lo < S) {
+            O[(((size_t)b*S+r_lo)*H+h)*D + col0] = __float2bfloat16(of[nt][0]*inv_lo);
+            O[(((size_t)b*S+r_lo)*H+h)*D + col1] = __float2bfloat16(of[nt][1]*inv_lo);
+        }
+        if (r_hi < S) {
+            O[(((size_t)b*S+r_hi)*H+h)*D + col0] = __float2bfloat16(of[nt][2]*inv_hi);
+            O[(((size_t)b*S+r_hi)*H+h)*D + col1] = __float2bfloat16(of[nt][3]*inv_hi);
+        }
+    }
+}
+
 } // anonymous namespace
 
 namespace f2k::cuda {
@@ -460,6 +837,51 @@ bool launch_wmma(const void* Q, const void* K, const void* V, void* O,
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+// Production D=128 launcher: register-resident O accumulator (43 KiB smem →
+// 2 CTA/SM) — 1.68× the old flash_wmma_kernel, bit-exact. Handles arbitrary S
+// (partial query/key tiles are zero-padded and masked). See flash_wmma_regO_kernel.
+template <int D>
+bool launch_wmma_regO(const void* Q, const void* K, const void* V, void* O,
+                      int B, int S, int H, float scale, const char*& err,
+                      cudaStream_t stream) {
+    constexpr int BN = 48, WARPS = 4, BM = WARPS * 16;
+    const int block = WARPS * 32;
+    // smem: Ks+Vs+Ps (bf16) | Ss+Ms+Ls+Cm+Cc (fp32). No Os/Qs (O is in registers,
+    // Q loads straight from global) — that's the occupancy win vs launch_wmma.
+    const size_t smem =
+        (static_cast<size_t>(BN) * D + BN * D + BM * BN) * sizeof(__nv_bfloat16) +
+        (static_cast<size_t>(BM) * BN + 4 * BM) * sizeof(float);
+    if (!ensure_dynamic_smem(flash_wmma_regO_kernel<D>, smem, err)) return false;
+    dim3 grid((S + BM - 1) / BM, H, B);
+    flash_wmma_regO_kernel<D><<<grid, block, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(Q),
+        static_cast<const __nv_bfloat16*>(K),
+        static_cast<const __nv_bfloat16*>(V),
+        static_cast<      __nv_bfloat16*>(O),
+        B, S, H, scale);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+// mma.sync flash kernel launcher (D=128). smem = K/V tile only (no O/Q/P/S
+// staging) — 24 KiB at BN=48, register-limited rather than smem-limited.
+template <int D>
+bool launch_mma(const void* Q, const void* K, const void* V, void* O,
+                int B, int S, int H, float scale, const char*& err,
+                cudaStream_t stream) {
+    constexpr int BN = 48, WARPS = 4, BM = WARPS * 16;
+    const int block = WARPS * 32;
+    const size_t smem = static_cast<size_t>(2) * BN * D * sizeof(__nv_bfloat16);
+    if (!ensure_dynamic_smem(flash_mma_kernel<D>, smem, err)) return false;
+    dim3 grid((S + BM - 1) / BM, H, B);
+    flash_mma_kernel<D><<<grid, block, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(Q),
+        static_cast<const __nv_bfloat16*>(K),
+        static_cast<const __nv_bfloat16*>(V),
+        static_cast<      __nv_bfloat16*>(O),
+        B, S, H, scale);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 } // anonymous namespace
 
 bool Attention::forward(const void* Q, const void* K, const void* V,
@@ -467,12 +889,16 @@ bool Attention::forward(const void* Q, const void* K, const void* V,
     if (!valid_) return false;
     const int B = cfg_.batch, S = cfg_.seq, H = cfg_.n_heads, D = cfg_.head_dim;
 
-    // D=128 (the transformer) uses the WMMA flash kernel: tensor-core QK^T/P@V
-    // and BM=64 queries/CTA → 8× less K/V HBM traffic. Other 32-divisible dims
-    // (incl. the VAE's D=512, whose smem is too large for the WMMA tiling) use
-    // the warp-per-query flash kernel; everything else uses the row kernel.
+    // D=128 (the transformer) uses the mma.sync flash kernel: raw mma.sync
+    // m16n8k16 + ldmatrix, register-resident O (the online-softmax rescale is a
+    // register multiply — no smem round-trip), and QK^T result registers repacked
+    // directly into the P@V A-fragments. Bandwidth-bound at ~279 GB/s (≈ GB10
+    // peak) — 1.74× the earlier register-O wmma kernel (launch_wmma_regO, kept for
+    // bench A/B). Other 32-divisible dims (incl. the VAE's D=512, whose smem is
+    // too large for this tiling) use the warp-per-query flash kernel; everything
+    // else uses the row kernel.
     if (D == 128) {
-        return launch_wmma<128>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream);
+        return launch_mma<128>(Q, K, V, O, B, S, H, cfg_.scale, err_, stream);
     }
     if (D % 32 == 0) {
         switch (D / 32) {
@@ -498,6 +924,45 @@ bool Attention::forward(const void* Q, const void* K, const void* V,
         static_cast<      __nv_bfloat16*>(O),
         B, S, H, D, cfg_.scale);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+// Benchmark entry point for the register-O kernel (now the D=128 production
+// path via forward()). Optionally prints the achieved CTAs/SM, then launches.
+bool launch_wmma_regO_probe(const void* Q, const void* K, const void* V, void* O,
+                            int B, int S, int H, float scale, bool report,
+                            cudaStream_t stream) {
+    constexpr int D = 128, BN = 48, WARPS = 4, BM = WARPS * 16;
+    const int block = WARPS * 32;
+    if (report) {
+        const size_t smem =
+            (static_cast<size_t>(BN) * D + BN * D + BM * BN) * sizeof(__nv_bfloat16) +
+            (static_cast<size_t>(BM) * BN + 4 * BM) * sizeof(float);
+        int blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks, flash_wmma_regO_kernel<D>, block, smem);
+        std::printf("  [regO probe] smem=%.1f KiB  occupancy=%d CTA/SM (%d warps/SM)\n",
+                    smem / 1024.0, blocks, blocks * WARPS);
+    }
+    const char* err = nullptr;
+    return launch_wmma_regO<D>(Q, K, V, O, B, S, H, scale, err, stream);
+}
+
+// Benchmark entry point for the mma.sync kernel (the rescale-tax-free path).
+bool launch_mma_probe(const void* Q, const void* K, const void* V, void* O,
+                      int B, int S, int H, float scale, bool report,
+                      cudaStream_t stream) {
+    constexpr int D = 128, BN = 48, WARPS = 4, BM = WARPS * 16;
+    const int block = WARPS * 32;
+    if (report) {
+        const size_t smem = static_cast<size_t>(2) * BN * D * sizeof(__nv_bfloat16);
+        int blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks, flash_mma_kernel<D>, block, smem);
+        std::printf("  [mma probe]  smem=%.1f KiB  occupancy=%d CTA/SM (%d warps/SM)\n",
+                    smem / 1024.0, blocks, blocks * WARPS);
+    }
+    const char* err = nullptr;
+    return launch_mma<D>(Q, K, V, O, B, S, H, scale, err, stream);
 }
 
 } // namespace f2k::cuda

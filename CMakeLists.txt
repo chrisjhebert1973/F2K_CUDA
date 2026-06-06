@@ -296,6 +296,9 @@ if(F2K_ENABLE_CUDA)
     add_executable(generate tools/generate.cu)
     target_link_libraries(generate PRIVATE f2k_cuda f2k_common)
 
+    add_executable(bench_attention tools/bench_attention.cu)
+    target_link_libraries(bench_attention PRIVATE f2k_cuda)
+
     add_executable(probe_ctx_emb tools/probe_ctx_emb.cu)
     target_link_libraries(probe_ctx_emb PRIVATE f2k_cuda f2k_common)
 
