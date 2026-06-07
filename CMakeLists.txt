@@ -97,6 +97,7 @@ add_library(f2k_common STATIC
     src/common/f2k_format.cpp
     src/common/f2k_model_loader.cpp
     src/common/tensor_router.cpp
+    src/common/bpe_tokenizer.cpp
 )
 target_include_directories(f2k_common PUBLIC src)
 target_link_libraries(f2k_common PUBLIC nlohmann_json)
@@ -208,6 +209,10 @@ add_executable(test_tensor_router tests/test_tensor_router.cpp)
 target_link_libraries(test_tensor_router PRIVATE f2k_common)
 add_test(NAME tensor_router COMMAND test_tensor_router)
 
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE f2k_common)
+add_test(NAME tokenizer COMMAND test_tokenizer)
+
 # Converter tool — gated on CUDA because it uses CUTLASS host-side types
 # (cutlass::float_e2m1_t / float_ue4m3_t) for proper FP4/FP8 rounding.
 if(F2K_ENABLE_CUDA)
@@ -294,7 +299,7 @@ if(F2K_ENABLE_CUDA)
     target_link_libraries(dump_qwen PRIVATE f2k_common)
 
     add_executable(generate tools/generate.cu)
-    target_link_libraries(generate PRIVATE f2k_cuda f2k_common)
+    target_link_libraries(generate PRIVATE f2k_cuda f2k_common stb)
 
     add_executable(bench_attention tools/bench_attention.cu)
     target_link_libraries(bench_attention PRIVATE f2k_cuda)

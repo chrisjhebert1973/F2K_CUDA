@@ -11,9 +11,13 @@
 #include "backend/cuda/vae_decoder.h"
 #include "backend/cuda/kernels/patchify.h"
 
+#include "common/bpe_tokenizer.h"
 #include "common/f2k_format.h"
 #include "common/f2k_model_loader.h"
 #include "common/tensor_router.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -56,13 +60,40 @@ static bool write_ppm(const std::string& path,
     return true;
 }
 
+// Maps [-1,1] CHW float → uint8 RGB and writes a PNG (interleaved RGB8).
+static bool write_png(const std::string& path,
+                      const float* rgb_chw, int C, int H, int W) {
+    if (C != 3) return false;
+    std::vector<uint8_t> bytes(static_cast<size_t>(H) * W * 3);
+    for (int h = 0; h < H; ++h)
+        for (int w = 0; w < W; ++w)
+            for (int c = 0; c < 3; ++c) {
+                const float v = rgb_chw[(c * H + h) * W + w];
+                const float u = std::clamp((v + 1.0f) * 0.5f, 0.0f, 1.0f);
+                bytes[(h * W + w) * 3 + c] = static_cast<uint8_t>(u * 255.0f + 0.5f);
+            }
+    return stbi_write_png(path.c_str(), W, H, 3, bytes.data(), W * 3) != 0;
+}
+
+// Dispatch on the output extension: .png → PNG, else PPM.
+static bool write_image(const std::string& path,
+                        const float* rgb_chw, int C, int H, int W) {
+    if (path.size() >= 4 &&
+        path.compare(path.size() - 4, 4, ".png") == 0)
+        return write_png(path, rgb_chw, C, H, W);
+    return write_ppm(path, rgb_chw, C, H, W);
+}
+
 int main(int argc, char** argv) {
-    // CLI: generate [--tokens <file>] [--embeds <file>] [--out <path>]
-    //   --tokens : feed token IDs to our Qwen3 encoder
+    // CLI: generate [--prompt <text>] [--tokens <file>] [--embeds <file>] [--out <path>]
+    //   --prompt : tokenize natively (BpeTokenizer) → Qwen3 encoder. Single-call path.
+    //   --tokens : feed token IDs from a file (tools/encode_prompt.py) to the encoder
     //   --embeds : skip our encoder; load a precomputed [seq, 12288] BF16 tensor
     //              (produced by tools/diffusers_prompt_embeds.py) and use it
     //              directly as text conditioning
+    //   --out    : .png → PNG, otherwise PPM
     std::string out_path = "out.ppm";
+    std::string prompt;
     std::string tokens_path;
     std::string embeds_path;
     std::string decode_latent_path;   // isolation: decode a ground-truth latent
@@ -72,7 +103,8 @@ int main(int argc, char** argv) {
     f2k::cuda::Precision precision = f2k::cuda::Precision::NVFP4;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if      (a == "--tokens" && i + 1 < argc) tokens_path = argv[++i];
+        if      (a == "--prompt" && i + 1 < argc) prompt      = argv[++i];
+        else if (a == "--tokens" && i + 1 < argc) tokens_path = argv[++i];
         else if (a == "--embeds" && i + 1 < argc) embeds_path = argv[++i];
         else if (a == "--out"    && i + 1 < argc) out_path    = argv[++i];
         else if (a == "--seed"   && i + 1 < argc) seed = static_cast<uint32_t>(std::stoul(argv[++i]));
@@ -114,10 +146,10 @@ int main(int argc, char** argv) {
     if (!vae_r.open(vae_path.string())) { std::fprintf(stderr, "open vae failed\n"); return 1; }
     std::printf("Loaded VAE       (%zu tensors)\n", vae_r.names().size());
 
-    // Qwen3 encoder — optional; only built if --tokens is supplied.
+    // Qwen3 encoder — optional; built if --prompt or --tokens is supplied.
     std::unique_ptr<f2k::F2KModelLoader> qwen_ld;
     std::unique_ptr<f2k::cuda::QwenEncoder> qwen;
-    bool use_qwen = !tokens_path.empty();
+    bool use_qwen = !tokens_path.empty() || !prompt.empty();
     if (use_qwen) {
         qwen_ld = std::make_unique<f2k::F2KModelLoader>();
         for (int i = 1; i <= 4; ++i) {
@@ -270,17 +302,32 @@ int main(int argc, char** argv) {
         std::printf("Text embeds:   loaded from %s (%d × %d)\n",
                     embeds_path.c_str(), hdr[0], hdr[1]);
     } else if (use_qwen) {
-        // Read tokens: int32 seq_len; int32[seq_len] ids
-        std::ifstream f(tokens_path, std::ios::binary);
-        if (!f) { std::fprintf(stderr, "open tokens %s failed\n", tokens_path.c_str()); return 1; }
-        int32_t hdr; f.read(reinterpret_cast<char*>(&hdr), sizeof(int32_t));
-        if (hdr != SEQ_TXT) {
-            std::fprintf(stderr, "token file seq=%d != expected %d\n", hdr, SEQ_TXT);
-            return 1;
-        }
+        // Token IDs: either tokenized natively from --prompt, or read from a file.
         std::vector<int32_t> h_ids(SEQ_TXT);
-        f.read(reinterpret_cast<char*>(h_ids.data()), SEQ_TXT * sizeof(int32_t));
-        if (!f) { std::fprintf(stderr, "truncated token file\n"); return 1; }
+        std::string src;
+        if (!prompt.empty()) {
+            f2k::BpeTokenizer tok;
+            const std::string tok_dir =
+                std::string(home) + "/models/flux2-klein-9B/tokenizer";
+            if (!tok.load(tok_dir)) {
+                std::fprintf(stderr, "tokenizer load (%s): %s\n",
+                             tok_dir.c_str(), tok.error().c_str());
+                return 1;
+            }
+            h_ids = tok.encode_for_flux(prompt, SEQ_TXT);
+            src = "\"" + prompt + "\"";
+        } else {
+            std::ifstream f(tokens_path, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "open tokens %s failed\n", tokens_path.c_str()); return 1; }
+            int32_t hdr; f.read(reinterpret_cast<char*>(&hdr), sizeof(int32_t));
+            if (hdr != SEQ_TXT) {
+                std::fprintf(stderr, "token file seq=%d != expected %d\n", hdr, SEQ_TXT);
+                return 1;
+            }
+            f.read(reinterpret_cast<char*>(h_ids.data()), SEQ_TXT * sizeof(int32_t));
+            if (!f) { std::fprintf(stderr, "truncated token file\n"); return 1; }
+            src = tokens_path;
+        }
         cudaMemcpy(d_token_ids, h_ids.data(), SEQ_TXT * sizeof(int32_t), cudaMemcpyHostToDevice);
 
         auto t_te0 = std::chrono::steady_clock::now();
@@ -289,9 +336,9 @@ int main(int argc, char** argv) {
         }
         cudaDeviceSynchronize();
         auto t_te1 = std::chrono::steady_clock::now();
-        std::printf("Text encode:   %.2f ms  (tokens=%s)\n",
+        std::printf("Text encode:   %.2f ms  (%s)\n",
                     std::chrono::duration<double, std::milli>(t_te1 - t_te0).count(),
-                    tokens_path.c_str());
+                    src.c_str());
     } else {
         // Fallback: random text buffer (produces noise-like images).
         std::vector<__nv_bfloat16> h_txt(txt_elems);
@@ -406,7 +453,7 @@ int main(int argc, char** argv) {
     }
     std::printf("Pixel range: [%.3f, %.3f]  nans=%d\n", mn, mx, nans);
 
-    if (!write_ppm(out_path, h_pixels_f.data(), 3, vae.output_H(), vae.output_W())) {
+    if (!write_image(out_path, h_pixels_f.data(), 3, vae.output_H(), vae.output_W())) {
         std::fprintf(stderr, "write %s failed\n", out_path.c_str()); return 1;
     }
     std::printf("Wrote %s (%d x %d)\n", out_path.c_str(), vae.output_W(), vae.output_H());
