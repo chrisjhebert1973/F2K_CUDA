@@ -132,11 +132,13 @@ def demath(text):
     return text
 
 # ---------------------------------------------------------------- PDF
+FRONT = 4   # cover, dedication, foreword, contents — unnumbered front matter
+
 class Book(FPDF):
     def footer(self):
-        if self.page_no() <= 1: return
+        if self.page_no() <= FRONT: return
         self.set_y(-12); self.set_font("Sans","",8); self.set_text_color(140)
-        self.cell(0, 8, str(self.page_no()-1), align="C")
+        self.cell(0, 8, str(self.page_no()-FRONT), align="C")
         self.set_text_color(0)
 
 BODY=10.5; LH=5.3
@@ -195,6 +197,8 @@ def code_block(text):
     pdf.multi_cell(0, 3.5, fix_glyphs(text.rstrip("\n"), mono=True), border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0); pdf.ln(1.8)
 
+FIRST_H1=[True]
+
 def render(tokens):
     i=0; list_stack=[]
     while i < len(tokens):
@@ -202,7 +206,13 @@ def render(tokens):
         if t.type=="heading_open":
             lvl=int(t.tag[1]); inl=tokens[i+1]
             if lvl==1:
-                pdf.add_page(); pdf.set_font("Sans","B",17)
+                # the first chapter reuses the fresh page left by the ToC placeholder
+                if FIRST_H1[0]: FIRST_H1[0]=False
+                else: pdf.add_page()
+                name=plain(inl)
+                if name.startswith("F2K_CUDA"): name="Introduction"
+                pdf.start_section(name)            # PDF outline + contents entry
+                pdf.set_font("Sans","B",17)
                 pdf.set_text_color(20,20,90); pdf.multi_cell(0,8,plain(inl),new_x="LMARGIN",new_y="NEXT")
                 pdf.set_text_color(0); pdf.ln(3)
             else:
@@ -299,15 +309,63 @@ pdf.set_font("Sans","B",22); pdf.set_text_color(25,25,80)
 pdf.multi_cell(0,10,"F2K_CUDA", align="C", new_x="LMARGIN", new_y="NEXT")
 pdf.set_font("Sans","",12.5); pdf.set_text_color(60,60,60)
 pdf.multi_cell(0,6,"From Diffusion Theory to a\nBlackwell GPU Implementation", align="C", new_x="LMARGIN", new_y="NEXT")
-pdf.ln(4)
-imgw = W
-pdf.image(COVER, x=pdf.l_margin, y=pdf.get_y(), w=imgw, h=imgw*ih/iw)
+pdf.ln(2.5)
+pdf.set_font("Serif","I",12); pdf.set_text_color(80,80,80)
+pdf.multi_cell(0,6,"by Chris Hebert and Claude", align="C", new_x="LMARGIN", new_y="NEXT")
+pdf.ln(3.5)
+imgw = 96
+pdf.image(COVER, x=(pdf.w-imgw)/2, y=pdf.get_y(), w=imgw, h=imgw*ih/iw)
 pdf.set_y(pdf.get_y()+imgw*ih/iw+6)
 pdf.set_font("Serif","I",11); pdf.set_text_color(90,90,90)
 pdf.multi_cell(0,5.5,"A long-form course on how FLUX.2-klein works and how it is\n"
                      "implemented, from scratch, in C++/CUDA/cuDNN for an NVIDIA GB10.",
                      align="C", new_x="LMARGIN", new_y="NEXT")
 pdf.set_text_color(0)
+
+# ---- dedication (page 2) ----
+pdf.add_page()
+pdf.ln(70)
+pdf.set_font("Serif","I",13.5); pdf.set_text_color(55,55,55)
+pdf.multi_cell(0,8,"Dedicated to Mr Bojangles", align="C", new_x="LMARGIN", new_y="NEXT")
+pdf.ln(2)
+pdf.set_font("Serif","I",11.5); pdf.set_text_color(115,115,115)
+pdf.multi_cell(0,7,"a dog like no other", align="C", new_x="LMARGIN", new_y="NEXT")
+pdf.set_text_color(0)
+
+# ---- foreword (page 3) ----
+pdf.add_page()
+pdf.ln(10)
+pdf.set_font("Sans","B",16); pdf.set_text_color(25,25,80)
+pdf.multi_cell(0,10,"Foreword", align="C", new_x="LMARGIN", new_y="NEXT")
+pdf.ln(1)
+pdf.set_font("Serif","I",10.5); pdf.set_text_color(120,120,120)
+pdf.multi_cell(0,6,"by Rocket", align="C", new_x="LMARGIN", new_y="NEXT")
+pdf.ln(28)
+pdf.set_font("Serif","",14); pdf.set_text_color(40,40,40)
+pdf.multi_cell(0,9,"woof woof grrrrr woof", align="C", new_x="LMARGIN", new_y="NEXT")
+pdf.set_text_color(0)
+
+# ---- contents (page 4); rendered at output() once page numbers are known ----
+def render_toc(pdf, outline):
+    pdf.set_left_margin(16); pdf.set_right_margin(16)
+    pdf.set_xy(16, 18)
+    W = pdf.w - 32
+    pdf.set_font("Sans","B",16); pdf.set_text_color(25,25,80)
+    pdf.cell(W, 10, "Contents", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    for s in outline:
+        if s.level != 0: continue
+        pdf.set_x(16)
+        pdf.set_font("Sans","",9); pdf.set_text_color(30,30,30)
+        pdf.cell(W-12, 4.7, s.name, border=0)
+        pdf.set_text_color(120,120,120)
+        pdf.cell(12, 4.7, str(s.page_number - FRONT), border=0, align="R",
+                 new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0)
+
+pdf.add_page()
+pdf.insert_toc_placeholder(render_toc, pages=1, reset_page_indices=False)
+# insert_toc_placeholder breaks to a fresh page; the first chapter reuses it (FIRST_H1)
 
 import glob
 files=[]
