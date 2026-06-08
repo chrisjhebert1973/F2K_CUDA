@@ -13,6 +13,7 @@ from markdown_it import MarkdownIt
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS = os.path.join(ROOT, "docs")
 COVER = os.path.join(ROOT, "imgs", "rocket_route66.png")
+ROCKET = os.path.join(ROOT, "imgs", "the_real_rocket.jpg")
 OUT = os.path.join(ROOT, "F2K_CUDA_course.pdf")
 FONTDIR = "/usr/share/fonts/truetype/dejavu"
 
@@ -337,10 +338,16 @@ pdf.add_page()
 pdf.ln(10)
 pdf.set_font("Sans","B",16); pdf.set_text_color(25,25,80)
 pdf.multi_cell(0,10,"Foreword", align="C", new_x="LMARGIN", new_y="NEXT")
-pdf.ln(1)
+pdf.ln(4)
+# Rocket, in person
+_rw=52; _riw,_rih=Image.open(ROCKET).size; _rh=_rw*_rih/_riw
+_rx=(pdf.w-_rw)/2; _ry=pdf.get_y()
+pdf.image(ROCKET, x=_rx, y=_ry, w=_rw, h=_rh)
+pdf.set_draw_color(170); pdf.set_line_width(0.3); pdf.rect(_rx,_ry,_rw,_rh)
+pdf.set_y(_ry+_rh+3)
 pdf.set_font("Serif","I",10.5); pdf.set_text_color(120,120,120)
 pdf.multi_cell(0,6,"by Rocket", align="C", new_x="LMARGIN", new_y="NEXT")
-pdf.ln(28)
+pdf.ln(22)
 pdf.set_font("Serif","",14); pdf.set_text_color(40,40,40)
 pdf.multi_cell(0,9,"woof woof grrrrr woof", align="C", new_x="LMARGIN", new_y="NEXT")
 pdf.set_text_color(0)
