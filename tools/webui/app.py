@@ -21,7 +21,7 @@ Run metadata (one JSON per run, in runs/):
 Older single-image runs (no `images` key, png named <id>.png) are normalised on
 read by _normalise().
 """
-import os, re, json, time, hmac, secrets, subprocess, threading, socket
+import os, re, json, time, hmac, secrets, subprocess, threading, socket, base64
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for, abort,
                    render_template_string, send_from_directory, flash, Response)
@@ -257,10 +257,20 @@ def generate_stream():
                 if not prompt: prompt = src.get("prompt", "")
     if not prompt:
         return Response('{"event":"error","msg":"empty prompt"}\n', mimetype="application/x-ndjson")
+    # optional inpaint mask (painted in the browser), as a data URL
+    mask_bytes = None
+    md = request.form.get("mask_data", "")
+    if init_image and md.startswith("data:image"):
+        try: mask_bytes = base64.b64decode(md.split(",", 1)[1])
+        except Exception: mask_bytes = None
 
     def gen():
         rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
         images, mode, err = [], "worker", ""
+        mask_path = None
+        if mask_bytes and init_image:
+            mask_path = os.path.join(RUNS, f"mask_{rid}.png")
+            with open(mask_path, "wb") as f: f.write(mask_bytes)
         t0 = time.time()
         with _gpu_lock:
             for i, seed in enumerate(seeds):
@@ -270,6 +280,8 @@ def generate_stream():
                                steps=steps, seed=seed, out=out_png, stream=True)
                 if init_image:
                     payload["init_image"] = init_image; payload["strength"] = strength
+                if mask_path:
+                    payload["mask_image"] = mask_path
                 final = None
                 try:
                     for j in _worker_stream(payload):
@@ -293,7 +305,8 @@ def generate_stream():
                     when=time.strftime("%Y-%m-%d %H:%M"), images=images)
         if init_image:
             meta["init_from"] = os.path.basename(init_image); meta["strength"] = strength
-        if kind: meta["kind"] = kind
+        if mask_path: meta["kind"] = "inpaint"
+        elif kind: meta["kind"] = kind
         save_run(meta)
         yield json.dumps({"event": "complete", "rid": rid}) + "\n"
 
@@ -315,6 +328,16 @@ def remix_form(rid, idx):
     im = m["images"][idx]
     if not im.get("ok"): abort(404)
     return render_template_string(REMIX, m=m, im=im, idx=idx, res_choices=RES_CHOICES,
+                                  prec_choices=PREC_CHOICES, count_choices=COUNT_CHOICES)
+
+@app.route("/inpaint/<rid>/<int:idx>")
+@login_required
+def inpaint_form(rid, idx):
+    m = load_run(rid)
+    if not m or idx < 0 or idx >= len(m["images"]): abort(404)
+    im = m["images"][idx]
+    if not im.get("ok"): abort(404)
+    return render_template_string(INPAINT, m=m, im=im, idx=idx, res_choices=RES_CHOICES,
                                   prec_choices=PREC_CHOICES, count_choices=COUNT_CHOICES)
 
 @app.route("/remix", methods=["POST"])
@@ -459,6 +482,7 @@ img.gen{width:100%;border-radius:12px;display:block;background:#000}
  background:#3b6cf0;color:#fff;font-weight:600}
 .del{background:#5a2330} .del:active{background:#46101c}
 .up{background:#1f7a6a} .up:active{background:#155448}
+.ip{background:#6c4bd6} .ip:active{background:#553aae}
 .thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;border:1px solid #2c3038}
 output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
 .tile img{cursor:zoom-in}
@@ -557,12 +581,13 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 {% if not m.ok %}<div class=flash>Generation failed.<pre style="white-space:pre-wrap;font-size:12px">{{m.error}}</pre></div>{% endif %}
 {% if m.init_from %}<div class=meta style="margin-bottom:10px;display:flex;gap:10px;align-items:center">
 <img src="{{url_for('img',fn=m.init_from)}}" style="width:56px;height:56px;object-fit:cover;border-radius:8px" onerror="this.style.display='none'">
-<span class=muted>{% if m.kind and m.kind.startswith('upscale') %}⬆ Upscaled from this · {{m.kind}}{% else %}🎨 Remixed from this · strength {{m.strength}}{% endif %}</span></div>{% endif %}
+<span class=muted>{% if m.kind and m.kind.startswith('upscale') %}⬆ Upscaled from this · {{m.kind}}{% elif m.kind=='inpaint' %}🖌 Inpainted from this · strength {{m.strength}}{% else %}🎨 Remixed from this · strength {{m.strength}}{% endif %}</span></div>{% endif %}
 <div class=grid>
 {% for im in m.images %}<div class=tile>
  {% if im.ok %}<img src="{{url_for('img',fn=im.file)}}" onclick="showLB(this.src)">{% else %}<div class=c style="padding:24px;text-align:center">failed</div>{% endif %}
  <div class=bar>
   {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>
+  <a class="btn ip" href="{{url_for('inpaint_form',rid=m.id,idx=loop.index0)}}">Inpaint</a>
   {% if m.res < 1536 %}<form method=post action="{{url_for('upscale',rid=m.id,idx=loop.index0)}}" onsubmit="document.getElementById('ov').style.display='flex'">
    <button class=up title="Upscale">Upscale</button></form>{% endif %}{% endif %}
   <form method=post action="{{url_for('delete',rid=m.id,idx=loop.index0)}}" onsubmit="return confirm('Delete this image?')">
@@ -605,6 +630,61 @@ REMIX = """<!doctype html><meta name=viewport content="width=device-width,initia
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
 </div><button>Remix</button></form>
 </div>{{js}}""".replace("{{css}}", BASE_CSS).replace("{{js}}", STREAM_JS)
+
+INPAINT_JS = """<script>
+(function(){
+ var c=document.getElementById('mk'), ctx=c.getContext('2d'); c.width=384; c.height=384;
+ var painting=false, painted=false;
+ function pos(e){ var r=c.getBoundingClientRect();
+   return [(e.clientX-r.left)*c.width/r.width, (e.clientY-r.top)*c.height/r.height]; }
+ function dot(e){ var r=c.getBoundingClientRect(), b=+document.getElementById('brush').value;
+   var p=pos(e); ctx.fillStyle='rgba(255,45,85,0.55)';
+   ctx.beginPath(); ctx.arc(p[0],p[1], b*c.width/r.width/2, 0, 7); ctx.fill(); painted=true; }
+ c.addEventListener('pointerdown',function(e){painting=true; dot(e); e.preventDefault();});
+ c.addEventListener('pointermove',function(e){ if(painting){ dot(e); e.preventDefault(); }});
+ window.addEventListener('pointerup',function(){painting=false;});
+ window.clearMask=function(){ ctx.clearRect(0,0,c.width,c.height); painted=false; };
+ window.inpaintSubmit=function(form){
+   if(!painted){ alert('Paint over the area you want to change first.'); return false; }
+   var mk=document.createElement('canvas'); mk.width=c.width; mk.height=c.height;
+   var mc=mk.getContext('2d'); var src=ctx.getImageData(0,0,c.width,c.height).data;
+   var out=mc.createImageData(c.width,c.height), d=out.data;
+   for(var i=0;i<src.length;i+=4){ var on=src[i+3]>10?255:0; d[i]=d[i+1]=d[i+2]=on; d[i+3]=255; }
+   mc.putImageData(out,0,0); form.mask_data.value=mk.toDataURL('image/png');
+   return streamSubmit(form);
+ };
+})();
+</script>"""
+
+INPAINT = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>F2K · inpaint</title><style>{{css}}</style>
+<div id=ov><img id=ovimg style="display:none;max-width:82vw;max-height:50vh;border-radius:10px;margin-bottom:10px"><div class=spin></div><div>Inpainting…<br><span class=muted id=ovsub>starting…</span></div></div>
+<div class=wrap><header><h1><a href="{{url_for('result',rid=m.id)}}">← Back</a> Inpaint</h1>
+<a href="{{url_for('gallery')}}">Gallery</a></header>
+<p class=muted>Paint over the area you want to change, then describe what should go there.</p>
+<div style="position:relative;width:100%;max-width:384px;margin:0 auto;touch-action:none">
+ <img src="{{url_for('img',fn=im.file)}}" style="width:100%;display:block;border-radius:10px;pointer-events:none;-webkit-user-select:none">
+ <canvas id=mk style="position:absolute;inset:0;width:100%;height:100%;border-radius:10px;touch-action:none"></canvas>
+</div>
+<div class=row style="margin-top:10px;align-items:flex-end">
+ <div><label>Brush <output class=sv id=bsv>40</output></label><input id=brush type=range min=10 max=140 value=40 oninput="document.getElementById('bsv').value=this.value"></div>
+ <div style="flex:0 0 auto"><button type=button class=del style="margin:0;width:auto;padding:12px 18px" onclick="clearMask()">Clear</button></div>
+</div>
+<form method=post action="{{url_for('generate_stream')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="return inpaintSubmit(this)">
+<input type=hidden name=src_rid value="{{m.id}}"><input type=hidden name=src_idx value="{{idx}}"><input type=hidden name=mask_data>
+<label>Prompt</label><textarea name=prompt placeholder="what should appear in the painted area" autofocus>{{m.prompt}}</textarea>
+<label>Strength <output class=sv id=sv>0.85</output> <span class=muted>(higher = fill more freely)</span></label>
+<input name=strength type=range min=0.5 max=1.0 step=0.05 value=0.85 oninput="document.getElementById('sv').value=(+this.value).toFixed(2)">
+<div class=row>
+ <div><label>Resolution</label><select name=res>{% for r in res_choices %}<option {{'selected' if r==(m.res|string)}}>{{r}}</option>{% endfor %}</select></div>
+ <div><label>Precision</label><select name=precision>{% for p in prec_choices %}<option {{'selected' if p==m.precision}}>{{p}}</option>{% endfor %}</select></div>
+ <div><label>Steps</label><input name=steps type=number value=12 min=1 max=30></div>
+</div>
+<div class=row>
+ <div><label>Batch</label><select name=count>{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
+ <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
+</div><button>Inpaint</button></form>
+</div>{{js}}{{ijs}}""".replace("{{css}}", BASE_CSS).replace("{{js}}", STREAM_JS).replace("{{ijs}}", INPAINT_JS)
 
 GALLERY = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · gallery</title><style>{{css}}</style><div class=wrap>

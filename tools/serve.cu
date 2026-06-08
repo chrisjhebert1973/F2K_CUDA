@@ -115,6 +115,33 @@ bool load_image_bf16(const std::string& path, int res,
     return true;
 }
 
+// Load a grayscale inpaint mask (white=regenerate), resize to res, and average-
+// pool to a per-latent-token weight m[SEQ_IMG] in [0,1]. The token grid is
+// H_P×W_P; each token covers a (res/H_P)×(res/W_P) image-pixel block — matching
+// patchify's token order (token r = hp*W_P + wp).
+bool load_mask_tokens(const std::string& path, int res, int H_P, int W_P,
+                      std::vector<float>& m, std::string& err){
+    int w=0,h=0,n=0;
+    uint8_t* px=stbi_load(path.c_str(),&w,&h,&n,1);   // force grayscale
+    if(!px){ err="load mask "+path+": "+stbi_failure_reason(); return false; }
+    std::vector<uint8_t> g;
+    const uint8_t* src=px;
+    if(w!=res || h!=res){ g.resize((size_t)res*res);
+        if(!stbir_resize_uint8_linear(px,w,h,0, g.data(),res,res,0, STBIR_1CHANNEL)){
+            stbi_image_free(px); err="mask resize failed"; return false; }
+        src=g.data(); }
+    const int bh=res/H_P, bw=res/W_P;
+    m.assign((size_t)H_P*W_P, 0.f);
+    for(int pr=0;pr<H_P;++pr)for(int pc=0;pc<W_P;++pc){
+        double s=0; int cnt=0;
+        for(int yy=pr*bh; yy<(pr+1)*bh && yy<res; ++yy)
+            for(int xx=pc*bw; xx<(pc+1)*bw && xx<res; ++xx){ s+=src[(size_t)yy*res+xx]; ++cnt; }
+        m[(size_t)pr*W_P+pc] = cnt ? (float)(s/cnt/255.0) : 0.f;
+    }
+    stbi_image_free(px);
+    return true;
+}
+
 // Resolution/precision-dependent resident pipeline (transformer + VAE + buffers).
 struct Pipeline {
     int res=0; std::string precision;
@@ -262,6 +289,7 @@ struct Worker {
         uint32_t seed=(uint32_t)req.value("seed",(int64_t)0);
         std::string out=req.value("out","");
         std::string init_image=req.value("init_image","");   // img2img source (abs path)
+        std::string mask_image=req.value("mask_image","");    // inpaint mask (abs path)
         float strength=req.value("strength",0.6f);           // 0..1; only used w/ init_image
         std::vector<std::string> timing; std::string err;
         auto t_all=Clock::now();
@@ -269,6 +297,8 @@ struct Worker {
         steps=std::max(1,std::min(30,steps));
         strength=std::max(0.05f,std::min(1.0f,strength));
         const bool img2img=!init_image.empty();
+        const bool inpaint=img2img && !mask_image.empty();
+        if(inpaint) strength=std::max(strength,0.6f);   // need enough steps to fill the region
         if(!ensure(res,precision,err)) return json{{"ok",false},{"error",err}};
         Pipeline& P=*pipe;
 
@@ -291,6 +321,7 @@ struct Worker {
 
         // build the starting latent tokens in P.d_tokens
         std::mt19937 rng(seed); std::normal_distribution<float> dn(0,1);
+        std::vector<float> x0v, eps_host, mask;   // inpaint state (transformer space)
         if(!img2img){
             // text-to-image: pure N(0,1) latent → patchify
             std::vector<__nv_bfloat16> hl(P.latent_elems);
@@ -314,15 +345,19 @@ struct Worker {
             cudaDeviceSynchronize();
             std::vector<__nv_bfloat16> x0(P.token_elems);
             cudaMemcpy(x0.data(),P.d_tokens,P.token_elems*2,cudaMemcpyDeviceToHost);
+            // clean latent (transformer space) + fixed noise, retained for inpaint
+            x0v.resize(P.token_elems); eps_host.resize(P.token_elems);
+            for(int r=0;r<P.SEQ_IMG;++r)for(int c=0;c<IN_CH;++c){ size_t i=(size_t)r*IN_CH+c;
+                x0v[i]=(b2f(x0[i])-P.bn_mean[c])/P.bn_std[c]; eps_host[i]=dn(rng); }
             const float t0=sched.t(i_start);
             std::vector<__nv_bfloat16> xt(P.token_elems);
-            for(int r=0;r<P.SEQ_IMG;++r)for(int c=0;c<IN_CH;++c){ size_t i=(size_t)r*IN_CH+c;
-                float clean=(b2f(x0[i])-P.bn_mean[c])/P.bn_std[c];   // → transformer space
-                xt[i]=f2b((1.f-t0)*clean + t0*dn(rng));
-            }
+            for(size_t i=0;i<P.token_elems;++i) xt[i]=f2b((1.f-t0)*x0v[i]+t0*eps_host[i]);
             cudaMemcpy(P.d_tokens,xt.data(),P.token_elems*2,cudaMemcpyHostToDevice);
-            timing.push_back("img2img encode "+std::to_string((int)(since(ie)*1000))+
-                             "ms (str "+std::to_string(strength).substr(0,3)+")");
+            if(inpaint && !load_mask_tokens(mask_image,res,P.H_P,P.W_P,mask,err))
+                return json{{"ok",false},{"error",err}};
+            timing.push_back(std::string(inpaint?"inpaint":"img2img")+" encode "+
+                             std::to_string((int)(since(ie)*1000))+"ms (str "+
+                             std::to_string(strength).substr(0,3)+")");
         }
 
         // denoise
@@ -330,7 +365,21 @@ struct Worker {
         const bool stream=req.value("stream",false);
         const int n_run=steps-i_start;
         const int prev_every=std::max(1,n_run/4);
+        std::vector<__nv_bfloat16> cur;   // inpaint host scratch
+        if(inpaint) cur.resize(P.token_elems);
         for(int i=i_start;i<steps;++i){
+            if(inpaint){
+                // lock the kept (unmasked) region to its known noised value at t_i
+                // so the model only regenerates the painted region, in context.
+                const float t=sched.t(i);
+                cudaMemcpy(cur.data(),P.d_tokens,P.token_elems*2,cudaMemcpyDeviceToHost);
+                for(int r=0;r<P.SEQ_IMG;++r){ const float mm=mask[r]; if(mm>=0.999f) continue;
+                    const float keep=1.f-mm;
+                    for(int c=0;c<IN_CH;++c){ size_t idx=(size_t)r*IN_CH+c;
+                        float known=(1.f-t)*x0v[idx]+t*eps_host[idx];
+                        cur[idx]=f2b(mm*b2f(cur[idx])+keep*known); } }
+                cudaMemcpy(P.d_tokens,cur.data(),P.token_elems*2,cudaMemcpyHostToDevice);
+            }
             auto ht=f2k::cuda::compute_timestep_embedding(sched.t(i)*1000.0f,TIME_DIM);
             cudaMemcpy(d_temb,ht.data(),TIME_DIM*2,cudaMemcpyHostToDevice);
             if(!P.model->forward(P.d_tokens,d_txt,d_temb,P.d_velocity,P.d_t_ws,P.model->workspace_size_bytes()))
@@ -345,6 +394,15 @@ struct Worker {
                                             {"w",ow},{"h",oh},{"img_b64",b}});
                 }
             }
+        }
+        if(inpaint){
+            // final lock: kept region = the exact clean latent (t=0)
+            cudaMemcpy(cur.data(),P.d_tokens,P.token_elems*2,cudaMemcpyDeviceToHost);
+            for(int r=0;r<P.SEQ_IMG;++r){ const float mm=mask[r]; if(mm>=0.999f) continue;
+                const float keep=1.f-mm;
+                for(int c=0;c<IN_CH;++c){ size_t idx=(size_t)r*IN_CH+c;
+                    cur[idx]=f2b(mm*b2f(cur[idx])+keep*x0v[idx]); } }
+            cudaMemcpy(P.d_tokens,cur.data(),P.token_elems*2,cudaMemcpyHostToDevice);
         }
         cudaDeviceSynchronize();
         timing.push_back("denoise "+std::to_string(since(dl)).substr(0,4)+"s ("+std::to_string(steps-i_start)+" steps)");
