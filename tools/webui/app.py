@@ -42,6 +42,7 @@ MAX_COUNT = 8
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("F2K_SECRET", secrets.token_hex(16))
+app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024   # camera photos can be big
 _gpu_lock = threading.Lock()   # serialize GPU jobs (one batch at a time)
 
 # ----------------------------------------------------------------- auth
@@ -242,6 +243,46 @@ def remix():
                      init_image=init_path, strength=round(strength, 2))
     return redirect(url_for("result", rid=meta["id"]))
 
+def _save_upload_square(file_storage, maxdim=1024):
+    """Read an uploaded image, center-crop to square, downscale to <=maxdim, and
+    save as PNG in runs/. Returns the abs path (or None on failure). The model
+    only generates square images, so center-cropping beats squashing."""
+    from PIL import Image, ImageOps
+    try:
+        img = ImageOps.exif_transpose(Image.open(file_storage.stream)).convert("RGB")
+    except Exception:
+        return None
+    w, h = img.size
+    s = min(w, h)
+    img = img.crop(((w - s) // 2, (h - s) // 2, (w - s) // 2 + s, (h - s) // 2 + s))
+    if s > maxdim:
+        img = img.resize((maxdim, maxdim), Image.BICUBIC)
+    name = f"upload_{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}.png"
+    path = os.path.join(RUNS, name)
+    img.save(path, "PNG")
+    return path
+
+@app.route("/upload_remix", methods=["POST"])
+@login_required
+def upload_remix():
+    f = request.files.get("photo")
+    if not f or not f.filename:
+        flash("Choose a photo first."); return redirect(url_for("index"))
+    prompt = (request.form.get("prompt", "") or "").strip()[:800]
+    if not prompt:
+        flash("Add a prompt describing how to remix the photo."); return redirect(url_for("index"))
+    init_path = _save_upload_square(f)
+    if not init_path:
+        flash("Could not read that image (HEIC isn't supported — use JPEG/PNG).")
+        return redirect(url_for("index"))
+    res, precision, steps, seeds = _parse_common(request.form)
+    try: strength = float(request.form.get("strength", "0.55"))
+    except ValueError: strength = 0.55
+    strength = max(0.05, min(1.0, strength))
+    meta = run_batch(prompt, res, precision, steps, seeds,
+                     init_image=init_path, strength=round(strength, 2))
+    return redirect(url_for("result", rid=meta["id"]))
+
 @app.route("/delete/<rid>/<int:idx>", methods=["POST"])
 @login_required
 def delete(rid, idx):
@@ -333,6 +374,26 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
  <div><label>Batch</label><select name=count onchange="document.getElementById('ovsub').textContent='resident worker · ~8s × '+this.value">{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
 </div><button>Generate</button></form>
+
+<h1 style="font-size:15px;margin:24px 0 8px;color:#aab0bd">📷 Remix a photo</h1>
+<form method=post action="{{url_for('upload_remix')}}" enctype=multipart/form-data
+ onsubmit="document.getElementById('ovsub').textContent='img2img from your photo';document.getElementById('ov').style.display='flex'">
+<label>Photo <span class=muted>(camera or library; center-cropped to square)</span></label>
+<input type=file name=photo accept="image/*" required>
+<label>Prompt</label><textarea name=prompt placeholder="e.g. as an oil painting · cyberpunk at night · turn Rocket into a bronze statue"></textarea>
+<label>Strength <output class=sv id=usv>0.55</output> <span class=muted>(low = closer to the photo)</span></label>
+<input name=strength type=range min=0.05 max=1.0 step=0.05 value=0.55
+ oninput="document.getElementById('usv').value=(+this.value).toFixed(2)">
+<div class=row>
+ <div><label>Resolution</label><select name=res>{% for r in res_choices %}<option {{'selected' if r=='1024'}}>{{r}}</option>{% endfor %}</select></div>
+ <div><label>Precision</label><select name=precision>{% for p in prec_choices %}<option {{'selected' if p=='fp8'}}>{{p}}</option>{% endfor %}</select></div>
+ <div><label>Steps</label><input name=steps type=number value=8 min=1 max=30></div>
+</div>
+<div class=row>
+ <div><label>Batch</label><select name=count>{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
+ <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
+</div><button>Remix photo</button></form>
+
 {% if cards %}<h1 style="font-size:15px;margin:22px 0 8px;color:#aab0bd">Recent</h1>
 <div class=grid>{% for c in cards %}<a class=card href="{{url_for('result',rid=c.rid)}}">
 <img src="{{url_for('img',fn=c.file)}}"><div class=c>{{c.prompt[:60]}}</div></a>{% endfor %}</div>{% endif %}
@@ -343,7 +404,9 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 <header><h1><a href="{{url_for('index')}}">← New</a></h1><a href="{{url_for('gallery')}}">Gallery</a></header>
 {% with msg=get_flashed_messages() %}{% if msg %}<div class=flash>{{msg[0]}}</div>{% endif %}{% endwith %}
 {% if not m.ok %}<div class=flash>Generation failed.<pre style="white-space:pre-wrap;font-size:12px">{{m.error}}</pre></div>{% endif %}
-{% if m.init_from %}<div class=meta style="margin-bottom:10px"><span class=muted>🎨 Remixed from <code>{{m.init_from}}</code> · strength {{m.strength}}</span></div>{% endif %}
+{% if m.init_from %}<div class=meta style="margin-bottom:10px;display:flex;gap:10px;align-items:center">
+<img src="{{url_for('img',fn=m.init_from)}}" style="width:56px;height:56px;object-fit:cover;border-radius:8px" onerror="this.style.display='none'">
+<span class=muted>🎨 Remixed from this · strength {{m.strength}}</span></div>{% endif %}
 <div class=grid>
 {% for im in m.images %}<div class=tile>
  {% if im.ok %}<img src="{{url_for('img',fn=im.file)}}">{% else %}<div class=c style="padding:24px;text-align:center">failed</div>{% endif %}
