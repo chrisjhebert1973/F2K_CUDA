@@ -500,7 +500,7 @@ async function streamSubmit(form){
  if(img){img.style.display='none';} if(sub){sub.textContent='starting…';}
  try{
   var resp=await fetch(form.dataset.stream,{method:'POST',body:new FormData(form)});
-  if(!resp.ok||!resp.body) throw 0;
+  if(!resp.ok||!resp.body) throw new Error('no stream (HTTP '+resp.status+')');
   var rd=resp.body.getReader(), dec=new TextDecoder(), buf='';
   while(true){
    var r=await rd.read(); if(r.done) break;
@@ -510,13 +510,12 @@ async function streamSubmit(form){
     var j=JSON.parse(ln);
     if(j.event==='progress'){ if(img){img.src='data:image/jpeg;base64,'+j.img_b64; img.style.display='block';}
       if(sub){sub.textContent='step '+j.step+'/'+j.total+(j.nimg>1?' · image '+(j.img+1)+'/'+j.nimg:'');} }
-    else if(j.event==='complete'){ window.location='/result/'+j.rid; return false; }
-    else if(j.event==='error'){ throw 0; }
+    else if(j.event==='complete'){ window.location='/result/'+j.rid; return; }
+    else if(j.event==='error'){ throw new Error(j.msg||'error'); }
    }
   }
-  throw 0;
- }catch(e){ form.removeAttribute('onsubmit'); form.submit(); }
- return false;
+  throw new Error('stream ended early');
+ }catch(e){ ov.style.display='none'; alert('Generation failed: '+(e&&e.message?e.message:e)); }
 }
 </script>"""
 
@@ -534,7 +533,7 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 <div class=wrap><header><h1>F2K_CUDA <small>image generator</small></h1>
 <a href="{{url_for('gallery')}}">Gallery</a></header>
 {% with m=get_flashed_messages() %}{% if m %}<div class=flash>{{m[0]}}</div>{% endif %}{% endwith %}
-<form method=post action="{{url_for('generate')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="return streamSubmit(this)">
+<form method=post action="{{url_for('generate')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="streamSubmit(this);return false">
 <label>Prompt</label><textarea name=prompt placeholder="My dog Rocket, a black and white Akita husky, ..." autofocus></textarea>
 <div class=row>
  <div><label>Resolution</label><select name=res>{% for r in res_choices %}<option {{'selected' if r=='1024'}}>{{r}}</option>{% endfor %}</select></div>
@@ -612,7 +611,7 @@ REMIX = """<!doctype html><meta name=viewport content="width=device-width,initia
  <img class=thumb style="flex:0 0 auto" src="{{url_for('img',fn=im.file)}}">
  <div><span class=muted>Image-to-image from this output. The structure is kept; higher
  strength re-renders more of it toward your prompt.</span></div></div>
-<form method=post action="{{url_for('remix')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="return streamSubmit(this)">
+<form method=post action="{{url_for('remix')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="streamSubmit(this);return false">
 <input type=hidden name=src_rid value="{{m.id}}"><input type=hidden name=src_idx value="{{idx}}">
 <label>Prompt</label><textarea name=prompt autofocus>{{m.prompt}}</textarea>
 <label>Strength <output class=sv id=sv>0.60</output> <span class=muted>(low = closer to original)</span></label>
@@ -649,7 +648,7 @@ INPAINT_JS = """<script>
    var out=mc.createImageData(c.width,c.height), d=out.data;
    for(var i=0;i<src.length;i+=4){ var on=src[i+3]>10?255:0; d[i]=d[i+1]=d[i+2]=on; d[i+3]=255; }
    mc.putImageData(out,0,0); form.mask_data.value=mk.toDataURL('image/png');
-   return streamSubmit(form);
+   streamSubmit(form); return false;
  };
 })();
 </script>"""
