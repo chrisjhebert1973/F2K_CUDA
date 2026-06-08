@@ -325,10 +325,14 @@ pdf.ln(3.5)
 imgw = 96
 pdf.image(COVER, x=(pdf.w-imgw)/2, y=pdf.get_y(), w=imgw, h=imgw*ih/iw)
 pdf.set_y(pdf.get_y()+imgw*ih/iw+6)
-pdf.set_font("Serif","I",11); pdf.set_text_color(90,90,90)
-pdf.multi_cell(0,5.5,"A long-form course on how FLUX.2-klein works and how it is\n"
-                     "implemented, from scratch, in C++/CUDA/cuDNN for an NVIDIA GB10.",
-                     align="C", new_x="LMARGIN", new_y="NEXT")
+_d1="A long-form course on how FLUX.2-klein works and how it is implemented,"
+_d2="from scratch, in C++/CUDA/cuDNN for an NVIDIA GB10."
+_ds=9.5; _avail=pdf.w-2*pdf.l_margin
+pdf.set_font("Sans","I",_ds)
+while _ds>6 and max(pdf.get_string_width(_d1),pdf.get_string_width(_d2))>_avail:
+    _ds-=0.25; pdf.set_font("Sans","I",_ds)   # shrink until each line fits on one row
+pdf.set_text_color(90,90,90)
+pdf.multi_cell(0,5.0,_d1+"\n"+_d2, align="C", new_x="LMARGIN", new_y="NEXT")
 pdf.set_text_color(0)
 
 # ---- dedication (page 2) ----
