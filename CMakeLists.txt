@@ -301,6 +301,9 @@ if(F2K_ENABLE_CUDA)
     add_executable(generate tools/generate.cu)
     target_link_libraries(generate PRIVATE f2k_cuda f2k_common stb)
 
+    add_executable(serve tools/serve.cu)
+    target_link_libraries(serve PRIVATE f2k_cuda f2k_common stb nlohmann_json)
+
     add_executable(bench_attention tools/bench_attention.cu)
     target_link_libraries(bench_attention PRIVATE f2k_cuda)
 

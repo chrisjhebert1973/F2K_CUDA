@@ -48,6 +48,9 @@ outputs/
 .venv/
 .claude/
 
+# Web UI runtime outputs (generated images + run metadata)
+tools/webui/runs/
+
 # Root-level debug image scratch (curated results live in imgs/)
 /*.ppm
 /*.png

@@ -1,0 +1,17 @@
+[Unit]
+Description=F2K_CUDA persistent inference worker (resident FLUX.2-klein models)
+After=network.target
+
+[Service]
+Type=simple
+User=chris
+Group=chris
+# The worker reads $HOME/models/flux2-klein-9B/... so HOME must be set.
+Environment=HOME=/home/chris
+WorkingDirectory=/home/chris/Documents/Development/Cpp/Projects/F2KTest
+ExecStart=/home/chris/Documents/Development/Cpp/Projects/F2KTest/build/serve --port 8765
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
