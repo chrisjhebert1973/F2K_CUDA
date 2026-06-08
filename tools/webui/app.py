@@ -344,6 +344,11 @@ img.gen{width:100%;border-radius:12px;display:block;background:#000}
 .del{background:#5a2330} .del:active{background:#46101c}
 .thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;border:1px solid #2c3038}
 output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
+.tile img{cursor:zoom-in}
+#lb{display:none;position:fixed;inset:0;background:#000e;z-index:20;align-items:center;
+ justify-content:center;padding:10px}
+#lb img{max-width:96vw;max-height:92vh;object-fit:contain;border-radius:10px}
+#lb .x{position:fixed;top:10px;right:16px;font-size:32px;line-height:1;color:#fff;opacity:.85}
 #ov{display:none;position:fixed;inset:0;background:#000b;align-items:center;justify-content:center;
  z-index:9;flex-direction:column;gap:14px;text-align:center;padding:20px}
 .spin{width:46px;height:46px;border:5px solid #3b6cf0;border-top-color:transparent;border-radius:50%;
@@ -409,7 +414,7 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 <span class=muted>🎨 Remixed from this · strength {{m.strength}}</span></div>{% endif %}
 <div class=grid>
 {% for im in m.images %}<div class=tile>
- {% if im.ok %}<img src="{{url_for('img',fn=im.file)}}">{% else %}<div class=c style="padding:24px;text-align:center">failed</div>{% endif %}
+ {% if im.ok %}<img src="{{url_for('img',fn=im.file)}}" onclick="showLB(this.src)">{% else %}<div class=c style="padding:24px;text-align:center">failed</div>{% endif %}
  <div class=bar>
   {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>{% endif %}
   <form method=post action="{{url_for('delete',rid=m.id,idx=loop.index0)}}" onsubmit="return confirm('Delete this image?')">
@@ -418,11 +423,14 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
  <div class=c>seed {{im.seed}}{% if im.nans %} · {{im.nans}} nan{% endif %}</div>
 </div>{% endfor %}
 </div>
-<p class=muted>Tap &amp; hold an image to save it to your iPad.</p>
+<p class=muted>Tap an image to enlarge · tap &amp; hold the large view to save it.</p>
 <div class=meta><b>{{m.prompt}}</b><br>
 <code>res {{m.res}} · {{m.precision}} · {{m.steps}} steps · {{m.count}} image{{'s' if m.count>1}}</code><br>
 <span class=muted>{{m.when}} · {{m.elapsed}}s total · {{m.mode}}</span>
-</div></div>""".replace("{{css}}", BASE_CSS)
+</div>
+<div id=lb onclick="this.style.display='none'"><span class=x>&times;</span><img id=lbimg src=""></div>
+<script>function showLB(s){document.getElementById('lbimg').src=s;document.getElementById('lb').style.display='flex'}</script>
+</div>""".replace("{{css}}", BASE_CSS)
 
 REMIX = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · remix</title><style>{{css}}</style>
