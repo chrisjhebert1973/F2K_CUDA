@@ -398,9 +398,7 @@ def upload_remix():
                      init_image=init_path, strength=round(strength, 2))
     return redirect(url_for("result", rid=meta["id"]))
 
-# 1536 is the current ceiling: at 2048 the VAE mid-block attention (latent 256²
-# = 65536 tokens) exceeds what the Linear/attention kernels handle. 1024→1536.
-UPSCALE_MAX = 1536
+UPSCALE_MAX = 2048        # true 2K (Linear gridDim.y fix unblocked 65536 tokens)
 UPSCALE_STRENGTH = 0.35   # low: add detail at higher res, keep the content
 
 @app.route("/upscale/<rid>/<int:idx>", methods=["POST"])
@@ -574,7 +572,7 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 
 RESULT = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · result</title><style>{{css}}</style>
-<div id=ov><div class=spin></div><div>Working…<br><span class=muted id=ovsub>upscaling · ~40s</span></div></div>
+<div id=ov><div class=spin></div><div>Working…<br><span class=muted id=ovsub>upscaling · ~40s (up to ~80s at 2K)</span></div></div>
 <div class=wrap>
 <header><h1><a href="{{url_for('index')}}">← New</a></h1><a href="{{url_for('gallery')}}">Gallery</a></header>
 {% with msg=get_flashed_messages() %}{% if msg %}<div class=flash>{{msg[0]}}</div>{% endif %}{% endwith %}
@@ -588,8 +586,8 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
  <div class=bar>
   {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>
   <a class="btn ip" href="{{url_for('inpaint_form',rid=m.id,idx=loop.index0)}}">Inpaint</a>
-  {% if m.res < 1536 %}<form method=post action="{{url_for('upscale',rid=m.id,idx=loop.index0)}}" onsubmit="document.getElementById('ov').style.display='flex'">
-   <button class=up title="Upscale">Upscale</button></form>{% endif %}{% endif %}
+  {% if m.res < 2048 %}<form method=post action="{{url_for('upscale',rid=m.id,idx=loop.index0)}}" onsubmit="document.getElementById('ov').style.display='flex'">
+   <button class=up title="Upscale 2×">Upscale</button></form>{% endif %}{% endif %}
   <form method=post action="{{url_for('delete',rid=m.id,idx=loop.index0)}}" onsubmit="return confirm('Delete this image?')">
    <button class=del>Delete</button></form>
  </div>

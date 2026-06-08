@@ -38,6 +38,7 @@
 #include "stb_image_resize2.h"
 
 #include <arpa/inet.h>
+#include <csignal>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -442,6 +443,7 @@ bool read_line(int fd, std::string& line){
 } // namespace
 
 int main(int argc,char**argv){
+    std::signal(SIGPIPE, SIG_IGN);   // a client disconnecting mid-stream must not kill us
     int port=8765;
     for(int i=1;i<argc;++i){ std::string a=argv[i];
         if(a=="--port"&&i+1<argc) port=std::atoi(argv[++i]); }

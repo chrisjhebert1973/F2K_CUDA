@@ -125,7 +125,7 @@ __global__ void quant_for_A_kernel(
     int rows, int K)
 {
     const int kblock = blockIdx.x;
-    const int row    = blockIdx.y;
+    const int row    = blockIdx.y + blockIdx.z * gridDim.y;   // z carries rows > 65535
     const int tid    = threadIdx.x;
     if (row >= rows) return;
 
@@ -171,7 +171,7 @@ __global__ void bias_add_bf16_kernel(__nv_bfloat16* __restrict__ y,
                                      const __nv_bfloat16* __restrict__ bias,
                                      int M, int N) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y;
+    const int m = blockIdx.y + blockIdx.z * gridDim.y;   // z carries rows > 65535
     if (n >= N || m >= M) return;
     const size_t off = static_cast<size_t>(m) * N + n;
     const float yv = __bfloat162float(y[off]);
@@ -272,7 +272,7 @@ __global__ void quant_for_A_fp8_kernel(
     int rows, int K)
 {
     const int kblock = blockIdx.x;
-    const int row    = blockIdx.y;
+    const int row    = blockIdx.y + blockIdx.z * gridDim.y;   // z carries rows > 65535
     const int tid    = threadIdx.x;
     if (row >= rows) return;
     const int k_idx = kblock * MX_VEC + tid;
@@ -574,7 +574,8 @@ bool Linear::forward(const void* x_bf16, void* y_bf16,
     if (I.prec == Linear::Precision::NVFP4) {
         // 1. Quantize x → (A_fp4, SFA) on device.
         const int n_kblocks = I.K / 16;
-        dim3 grid(n_kblocks, I.M), block(16);
+        const int gy = I.M < 65535 ? I.M : 65535;          // gridDim.y max is 65535
+        dim3 grid(n_kblocks, gy, (I.M + gy - 1) / gy), block(16);
         quant_for_A_kernel<LayoutSFA><<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x_bf16),
             static_cast<uint8_t*>(A_data),
@@ -592,7 +593,8 @@ bool Linear::forward(const void* x_bf16, void* y_bf16,
         // 1. Quantize x → (A_e4m3, SFA) on device (MXFP8, per-32 UE8M0).
         namespace fp8ns = f2k_linear_fp8;
         const int n_kblocks = I.K / fp8ns::MX_VEC;
-        dim3 grid(n_kblocks, I.M), block(fp8ns::MX_VEC);
+        const int gy = I.M < 65535 ? I.M : 65535;          // gridDim.y max is 65535
+        dim3 grid(n_kblocks, gy, (I.M + gy - 1) / gy), block(fp8ns::MX_VEC);
         fp8ns::quant_for_A_fp8_kernel<fp8ns::LayoutSFA><<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x_bf16),
             static_cast<uint8_t*>(A_data),
@@ -611,7 +613,8 @@ bool Linear::forward(const void* x_bf16, void* y_bf16,
     // 3. Optional bias.
     if (I.bias_dev) {
         constexpr int BLK = 256;
-        dim3 bgrid((I.N + BLK - 1) / BLK, I.M), bblock(BLK);
+        const int gy = I.M < 65535 ? I.M : 65535;          // gridDim.y max is 65535
+        dim3 bgrid((I.N + BLK - 1) / BLK, gy, (I.M + gy - 1) / gy), bblock(BLK);
         bias_add_bf16_kernel<<<bgrid, bblock, 0, stream>>>(
             static_cast<__nv_bfloat16*>(y_bf16),
             static_cast<const __nv_bfloat16*>(I.bias_dev),
