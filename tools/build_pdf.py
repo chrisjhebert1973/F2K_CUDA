@@ -193,9 +193,17 @@ def plain(tok):  # for tables / headings: flatten to demath'd plain text
     return fix_glyphs(demath("".join(c.content for c in (tok.children or []) if c.type in ("text","code_inline","softbreak") or c.content)).replace("\n"," "))
 
 def code_block(text):
-    pdf.ln(1.5); pdf.set_font("Mono","",7.2); pdf.set_fill_color(244,244,246)
+    body = fix_glyphs(text.rstrip("\n"), mono=True)
+    lines = body.split("\n")
+    avail = pdf.w - pdf.l_margin - pdf.r_margin
+    size = 7.2
+    pdf.set_font("Mono","",size)
+    widest = max((pdf.get_string_width(ln) for ln in lines), default=0.0)
+    if widest > avail*0.97:                   # shrink to fit the widest line — no wrap
+        size = max(4.8, size * avail*0.97 / widest)   # (slack so the widest line can't wrap)
+    pdf.ln(1.5); pdf.set_font("Mono","",size); pdf.set_fill_color(244,244,246)
     pdf.set_draw_color(225); pdf.set_text_color(20)
-    pdf.multi_cell(0, 3.5, fix_glyphs(text.rstrip("\n"), mono=True), border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.multi_cell(0, 3.5*size/7.2, body, border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0); pdf.ln(1.8)
 
 FIRST_H1=[True]
