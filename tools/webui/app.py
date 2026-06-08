@@ -136,8 +136,10 @@ def _subprocess_call(out_png, prompt, res, precision, steps, seed):
     return dict(ok=(proc.returncode == 0 and os.path.exists(out_png)), timing=timing,
                 error=(log[-1500:] if proc.returncode != 0 else ""))
 
-def run_batch(prompt, res, precision, steps, seeds):
-    """Generate len(seeds) images for one prompt, serialised on the GPU lock."""
+def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None):
+    """Generate len(seeds) images for one prompt, serialised on the GPU lock.
+    If init_image (abs path) is given, runs img2img at the given strength — only
+    the persistent worker supports this; the subprocess fallback is txt2img."""
     rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
     images, mode, err = [], "worker", ""
     t0 = time.time()
@@ -147,6 +149,9 @@ def run_batch(prompt, res, precision, steps, seeds):
             out_png = os.path.join(RUNS, fn)
             payload = dict(prompt=prompt, res=res, precision=precision,
                            steps=steps, seed=seed, out=out_png)
+            if init_image:
+                payload["init_image"] = init_image
+                payload["strength"] = strength
             try:
                 r = _worker_call(payload)
             except OSError:
@@ -160,6 +165,9 @@ def run_batch(prompt, res, precision, steps, seeds):
                 count=len(seeds), ok=any(im["ok"] for im in images),
                 elapsed=round(time.time() - t0, 1), error=err, mode=mode,
                 when=time.strftime("%Y-%m-%d %H:%M"), images=images)
+    if init_image:
+        meta["init_from"] = os.path.basename(init_image)
+        meta["strength"] = strength
     save_run(meta)
     return meta
 
@@ -205,6 +213,34 @@ def result(rid):
     m = load_run(rid)
     if not m: abort(404)
     return render_template_string(RESULT, m=m)
+
+@app.route("/remix/<rid>/<int:idx>")
+@login_required
+def remix_form(rid, idx):
+    m = load_run(rid)
+    if not m or idx < 0 or idx >= len(m["images"]): abort(404)
+    im = m["images"][idx]
+    if not im.get("ok"): abort(404)
+    return render_template_string(REMIX, m=m, im=im, idx=idx, res_choices=RES_CHOICES,
+                                  prec_choices=PREC_CHOICES, count_choices=COUNT_CHOICES)
+
+@app.route("/remix", methods=["POST"])
+@login_required
+def remix():
+    src = load_run(request.form.get("src_rid", ""))
+    try: src_idx = int(request.form.get("src_idx", "0"))
+    except ValueError: src_idx = 0
+    if not src or src_idx < 0 or src_idx >= len(src["images"]): abort(404)
+    init_path = os.path.join(RUNS, os.path.basename(src["images"][src_idx]["file"]))
+    if not os.path.exists(init_path): abort(404)
+    prompt = (request.form.get("prompt", "") or "").strip()[:800] or src.get("prompt", "")
+    res, precision, steps, seeds = _parse_common(request.form)
+    try: strength = float(request.form.get("strength", "0.6"))
+    except ValueError: strength = 0.6
+    strength = max(0.05, min(1.0, strength))
+    meta = run_batch(prompt, res, precision, steps, seeds,
+                     init_image=init_path, strength=round(strength, 2))
+    return redirect(url_for("result", rid=meta["id"]))
 
 @app.route("/delete/<rid>/<int:idx>", methods=["POST"])
 @login_required
@@ -261,8 +297,12 @@ img.gen{width:100%;border-radius:12px;display:block;background:#000}
 .tile{background:#1d2026;border:1px solid #2c3038;border-radius:12px;overflow:hidden}
 .tile img{width:100%;display:block}
 .tile .bar{display:flex;gap:8px;padding:8px}
-.tile .bar form{flex:1;margin:0} .tile .bar button{margin:0;padding:9px;font-size:13px;border-radius:9px}
+.tile .bar form{flex:1;margin:0} .tile .bar button{margin:0;padding:9px;font-size:13px;border-radius:9px;width:100%}
+.tile .bar .btn{flex:1;display:block;text-align:center;padding:9px;font-size:13px;border-radius:9px;
+ background:#3b6cf0;color:#fff;font-weight:600}
 .del{background:#5a2330} .del:active{background:#46101c}
+.thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;border:1px solid #2c3038}
+output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
 #ov{display:none;position:fixed;inset:0;background:#000b;align-items:center;justify-content:center;
  z-index:9;flex-direction:column;gap:14px;text-align:center;padding:20px}
 .spin{width:46px;height:46px;border:5px solid #3b6cf0;border-top-color:transparent;border-radius:50%;
@@ -303,10 +343,12 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 <header><h1><a href="{{url_for('index')}}">← New</a></h1><a href="{{url_for('gallery')}}">Gallery</a></header>
 {% with msg=get_flashed_messages() %}{% if msg %}<div class=flash>{{msg[0]}}</div>{% endif %}{% endwith %}
 {% if not m.ok %}<div class=flash>Generation failed.<pre style="white-space:pre-wrap;font-size:12px">{{m.error}}</pre></div>{% endif %}
+{% if m.init_from %}<div class=meta style="margin-bottom:10px"><span class=muted>🎨 Remixed from <code>{{m.init_from}}</code> · strength {{m.strength}}</span></div>{% endif %}
 <div class=grid>
 {% for im in m.images %}<div class=tile>
  {% if im.ok %}<img src="{{url_for('img',fn=im.file)}}">{% else %}<div class=c style="padding:24px;text-align:center">failed</div>{% endif %}
  <div class=bar>
+  {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>{% endif %}
   <form method=post action="{{url_for('delete',rid=m.id,idx=loop.index0)}}" onsubmit="return confirm('Delete this image?')">
    <button class=del>Delete</button></form>
  </div>
@@ -318,6 +360,32 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 <code>res {{m.res}} · {{m.precision}} · {{m.steps}} steps · {{m.count}} image{{'s' if m.count>1}}</code><br>
 <span class=muted>{{m.when}} · {{m.elapsed}}s total · {{m.mode}}</span>
 </div></div>""".replace("{{css}}", BASE_CSS)
+
+REMIX = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>F2K · remix</title><style>{{css}}</style>
+<div id=ov><div class=spin></div><div>Remixing…<br><span class=muted id=ovsub>img2img · resident worker</span></div></div>
+<div class=wrap><header><h1><a href="{{url_for('result',rid=m.id)}}">← Back</a> Remix</h1>
+<a href="{{url_for('gallery')}}">Gallery</a></header>
+<div class=row style="align-items:center;margin-bottom:6px">
+ <img class=thumb style="flex:0 0 auto" src="{{url_for('img',fn=im.file)}}">
+ <div><span class=muted>Image-to-image from this output. The structure is kept; higher
+ strength re-renders more of it toward your prompt.</span></div></div>
+<form method=post action="{{url_for('remix')}}" onsubmit="document.getElementById('ov').style.display='flex'">
+<input type=hidden name=src_rid value="{{m.id}}"><input type=hidden name=src_idx value="{{idx}}">
+<label>Prompt</label><textarea name=prompt autofocus>{{m.prompt}}</textarea>
+<label>Strength <output class=sv id=sv>0.60</output> <span class=muted>(low = closer to original)</span></label>
+<input name=strength type=range min=0.05 max=1.0 step=0.05 value=0.6
+ oninput="document.getElementById('sv').value=(+this.value).toFixed(2)">
+<div class=row>
+ <div><label>Resolution</label><select name=res>{% for r in res_choices %}<option {{'selected' if r==(m.res|string)}}>{{r}}</option>{% endfor %}</select></div>
+ <div><label>Precision</label><select name=precision>{% for p in prec_choices %}<option {{'selected' if p==m.precision}}>{{p}}</option>{% endfor %}</select></div>
+ <div><label>Steps</label><input name=steps type=number value={{m.steps}} min=1 max=30></div>
+</div>
+<div class=row>
+ <div><label>Batch</label><select name=count>{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
+ <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
+</div><button>Remix</button></form>
+</div>""".replace("{{css}}", BASE_CSS)
 
 GALLERY = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · gallery</title><style>{{css}}</style><div class=wrap>
