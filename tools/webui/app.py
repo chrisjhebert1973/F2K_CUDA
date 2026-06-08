@@ -24,7 +24,7 @@ read by _normalise().
 import os, re, json, time, hmac, secrets, subprocess, threading, socket
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for, abort,
-                   render_template_string, send_from_directory, flash)
+                   render_template_string, send_from_directory, flash, Response)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GENERATE = os.path.join(ROOT, "build", "generate")
@@ -126,6 +126,28 @@ def _worker_call(payload, timeout=600):
         s.close()
     return json.loads(buf)
 
+def _worker_stream(payload, timeout=600):
+    """Generator: send a streaming job to the worker and yield each JSON message
+    (progress events, then the final result). Raises OSError if the worker is down."""
+    s = socket.create_connection((WORKER_HOST, WORKER_PORT), timeout=10)
+    s.settimeout(timeout)
+    try:
+        s.sendall((json.dumps(payload) + "\n").encode())
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk: break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip(): continue
+                j = json.loads(line)
+                yield j
+                if j.get("event") != "progress":
+                    return
+    finally:
+        s.close()
+
 def _subprocess_call(out_png, prompt, res, precision, steps, seed):
     """Fallback: one-shot generate binary (slow — reloads the model)."""
     args = [GENERATE, "--prompt", prompt, "--res", str(res), "--precision", precision,
@@ -210,6 +232,73 @@ def generate():
     res, precision, steps, seeds = _parse_common(request.form)
     meta = run_batch(prompt, res, precision, steps, seeds)
     return redirect(url_for("result", rid=meta["id"]))
+
+@app.route("/generate_stream", methods=["POST"])
+@login_required
+def generate_stream():
+    """Streaming generate (NDJSON): relays the worker's live preview events to the
+    browser, saves the run, then emits {event:complete,rid}. Handles plain txt2img
+    and remix-from-an-existing-output (src_rid/src_idx + strength)."""
+    prompt = (request.form.get("prompt", "") or "").strip()[:800]
+    res, precision, steps, seeds = _parse_common(request.form)
+    # optional remix init from an existing output
+    init_image = None; strength = None; kind = None
+    src = load_run(request.form.get("src_rid", "")) if request.form.get("src_rid") else None
+    if src:
+        try: si = int(request.form.get("src_idx", "0"))
+        except ValueError: si = 0
+        if 0 <= si < len(src["images"]):
+            cand = os.path.join(RUNS, os.path.basename(src["images"][si]["file"]))
+            if os.path.exists(cand):
+                init_image = cand
+                try: strength = max(0.05, min(1.0, float(request.form.get("strength", "0.6"))))
+                except ValueError: strength = 0.6
+                strength = round(strength, 2)
+                if not prompt: prompt = src.get("prompt", "")
+    if not prompt:
+        return Response('{"event":"error","msg":"empty prompt"}\n', mimetype="application/x-ndjson")
+
+    def gen():
+        rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
+        images, mode, err = [], "worker", ""
+        t0 = time.time()
+        with _gpu_lock:
+            for i, seed in enumerate(seeds):
+                fn = f"{rid}_{i}.png"
+                out_png = os.path.join(RUNS, fn)
+                payload = dict(prompt=prompt, res=res, precision=precision,
+                               steps=steps, seed=seed, out=out_png, stream=True)
+                if init_image:
+                    payload["init_image"] = init_image; payload["strength"] = strength
+                final = None
+                try:
+                    for j in _worker_stream(payload):
+                        if j.get("event") == "progress":
+                            j["img"] = i; j["nimg"] = len(seeds)
+                            yield json.dumps(j) + "\n"
+                        else:
+                            final = j
+                except OSError:
+                    mode = "subprocess (worker down)"
+                    final = _subprocess_call(out_png, prompt, res, precision, steps, seed)
+                final = final or {"ok": False, "error": "no response"}
+                if not final.get("ok") and not err: err = final.get("error", "")
+                images.append(dict(seed=seed, file=fn, ok=final.get("ok", False),
+                                   nans=final.get("nans", 0), timing=final.get("timing", [])))
+                yield json.dumps({"event": "image_done", "img": i, "file": fn,
+                                  "ok": final.get("ok", False), "nimg": len(seeds)}) + "\n"
+        meta = dict(id=rid, prompt=prompt, res=res, precision=precision, steps=steps,
+                    count=len(seeds), ok=any(im["ok"] for im in images),
+                    elapsed=round(time.time() - t0, 1), error=err, mode=mode,
+                    when=time.strftime("%Y-%m-%d %H:%M"), images=images)
+        if init_image:
+            meta["init_from"] = os.path.basename(init_image); meta["strength"] = strength
+        if kind: meta["kind"] = kind
+        save_run(meta)
+        yield json.dumps({"event": "complete", "rid": rid}) + "\n"
+
+    return Response(gen(), mimetype="application/x-ndjson",
+                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
 @app.route("/result/<rid>")
 @login_required
@@ -382,6 +471,33 @@ output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
 .spin{width:46px;height:46px;border:5px solid #3b6cf0;border-top-color:transparent;border-radius:50%;
  animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
 """
+STREAM_JS = """<script>
+async function streamSubmit(form){
+ var ov=document.getElementById('ov'); ov.style.display='flex';
+ var img=document.getElementById('ovimg'), sub=document.getElementById('ovsub');
+ if(img){img.style.display='none';} if(sub){sub.textContent='starting…';}
+ try{
+  var resp=await fetch(form.dataset.stream,{method:'POST',body:new FormData(form)});
+  if(!resp.ok||!resp.body) throw 0;
+  var rd=resp.body.getReader(), dec=new TextDecoder(), buf='';
+  while(true){
+   var r=await rd.read(); if(r.done) break;
+   buf+=dec.decode(r.value,{stream:true}); var nl;
+   while((nl=buf.indexOf('\\n'))>=0){
+    var ln=buf.slice(0,nl); buf=buf.slice(nl+1); if(!ln.trim()) continue;
+    var j=JSON.parse(ln);
+    if(j.event==='progress'){ if(img){img.src='data:image/jpeg;base64,'+j.img_b64; img.style.display='block';}
+      if(sub){sub.textContent='step '+j.step+'/'+j.total+(j.nimg>1?' · image '+(j.img+1)+'/'+j.nimg:'');} }
+    else if(j.event==='complete'){ window.location='/result/'+j.rid; return false; }
+    else if(j.event==='error'){ throw 0; }
+   }
+  }
+  throw 0;
+ }catch(e){ form.removeAttribute('onsubmit'); form.submit(); }
+ return false;
+}
+</script>"""
+
 LOGIN = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · login</title><style>{{css}}</style><div class=wrap>
 <header><h1>F2K_CUDA</h1></header>
@@ -392,11 +508,11 @@ LOGIN = """<!doctype html><meta name=viewport content="width=device-width,initia
 
 INDEX = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · generate</title><style>{{css}}</style>
-<div id=ov><div class=spin></div><div>Generating…<br><span class=muted id=ovsub>resident worker · ~8s per image</span></div></div>
+<div id=ov><img id=ovimg style="display:none;max-width:82vw;max-height:50vh;border-radius:10px;margin-bottom:10px"><div class=spin></div><div>Generating…<br><span class=muted id=ovsub>starting…</span></div></div>
 <div class=wrap><header><h1>F2K_CUDA <small>image generator</small></h1>
 <a href="{{url_for('gallery')}}">Gallery</a></header>
 {% with m=get_flashed_messages() %}{% if m %}<div class=flash>{{m[0]}}</div>{% endif %}{% endwith %}
-<form method=post action="{{url_for('generate')}}" onsubmit="document.getElementById('ov').style.display='flex'">
+<form method=post action="{{url_for('generate')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="return streamSubmit(this)">
 <label>Prompt</label><textarea name=prompt placeholder="My dog Rocket, a black and white Akita husky, ..." autofocus></textarea>
 <div class=row>
  <div><label>Resolution</label><select name=res>{% for r in res_choices %}<option {{'selected' if r=='1024'}}>{{r}}</option>{% endfor %}</select></div>
@@ -430,7 +546,7 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 {% if cards %}<h1 style="font-size:15px;margin:22px 0 8px;color:#aab0bd">Recent</h1>
 <div class=grid>{% for c in cards %}<a class=card href="{{url_for('result',rid=c.rid)}}">
 <img src="{{url_for('img',fn=c.file)}}"><div class=c>{{c.prompt[:60]}}</div></a>{% endfor %}</div>{% endif %}
-</div>""".replace("{{css}}", BASE_CSS)
+</div>{{js}}""".replace("{{css}}", BASE_CSS).replace("{{js}}", STREAM_JS)
 
 RESULT = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · result</title><style>{{css}}</style>
@@ -466,14 +582,14 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 
 REMIX = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · remix</title><style>{{css}}</style>
-<div id=ov><div class=spin></div><div>Remixing…<br><span class=muted id=ovsub>img2img · resident worker</span></div></div>
+<div id=ov><img id=ovimg style="display:none;max-width:82vw;max-height:50vh;border-radius:10px;margin-bottom:10px"><div class=spin></div><div>Remixing…<br><span class=muted id=ovsub>starting…</span></div></div>
 <div class=wrap><header><h1><a href="{{url_for('result',rid=m.id)}}">← Back</a> Remix</h1>
 <a href="{{url_for('gallery')}}">Gallery</a></header>
 <div class=row style="align-items:center;margin-bottom:6px">
  <img class=thumb style="flex:0 0 auto" src="{{url_for('img',fn=im.file)}}">
  <div><span class=muted>Image-to-image from this output. The structure is kept; higher
  strength re-renders more of it toward your prompt.</span></div></div>
-<form method=post action="{{url_for('remix')}}" onsubmit="document.getElementById('ov').style.display='flex'">
+<form method=post action="{{url_for('remix')}}" data-stream="{{url_for('generate_stream')}}" onsubmit="return streamSubmit(this)">
 <input type=hidden name=src_rid value="{{m.id}}"><input type=hidden name=src_idx value="{{idx}}">
 <label>Prompt</label><textarea name=prompt autofocus>{{m.prompt}}</textarea>
 <label>Strength <output class=sv id=sv>0.60</output> <span class=muted>(low = closer to original)</span></label>
@@ -488,7 +604,7 @@ REMIX = """<!doctype html><meta name=viewport content="width=device-width,initia
  <div><label>Batch</label><select name=count>{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
 </div><button>Remix</button></form>
-</div>""".replace("{{css}}", BASE_CSS)
+</div>{{js}}""".replace("{{css}}", BASE_CSS).replace("{{js}}", STREAM_JS)
 
 GALLERY = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>F2K · gallery</title><style>{{css}}</style><div class=wrap>

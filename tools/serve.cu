@@ -48,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -71,6 +72,23 @@ bool write_png(const std::string& path, const float* rgb_chw, int H, int W){
         b[((size_t)h*W+w)*3+c]=(uint8_t)(v*255.f+0.5f);
     }
     return stbi_write_png(path.c_str(), W, H, 3, b.data(), W*3)!=0;
+}
+
+// Base64 (standard alphabet) for streaming preview PNGs inline.
+std::string b64encode(const uint8_t* d, size_t n){
+    static const char* T="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o; o.reserve((n+2)/3*4);
+    size_t i=0;
+    for(; i+3<=n; i+=3){ uint32_t v=(d[i]<<16)|(d[i+1]<<8)|d[i+2];
+        o+=T[(v>>18)&63]; o+=T[(v>>12)&63]; o+=T[(v>>6)&63]; o+=T[v&63]; }
+    if(n-i==1){ uint32_t v=d[i]<<16; o+=T[(v>>18)&63]; o+=T[(v>>12)&63]; o+="=="; }
+    else if(n-i==2){ uint32_t v=(d[i]<<16)|(d[i+1]<<8);
+        o+=T[(v>>18)&63]; o+=T[(v>>12)&63]; o+=T[(v>>6)&63]; o+="="; }
+    return o;
+}
+void png_collect(void* ctx, void* data, int size){
+    auto* v=static_cast<std::vector<uint8_t>*>(ctx);
+    auto* p=static_cast<uint8_t*>(data); v->insert(v->end(), p, p+size);
 }
 
 // Load an image, resize to res×res, return BF16 [3,res,res] in model space
@@ -206,7 +224,39 @@ struct Worker {
         pipe=std::move(p); return true;
     }
 
-    json generate(const json& req){
+    // Decode the in-progress latent (P.d_tokens) into a small base64 PNG for
+    // live preview. Reuses d_velocity/d_latent/d_pixels (free between denoise
+    // steps); leaves d_tokens untouched. Returns "" on failure.
+    std::string preview_b64(Pipeline& P, int maxdim, int& ow, int& oh){
+        std::vector<__nv_bfloat16> ht(P.token_elems);
+        cudaMemcpy(ht.data(),P.d_tokens,P.token_elems*2,cudaMemcpyDeviceToHost);
+        for(int r=0;r<P.SEQ_IMG;++r)for(int c=0;c<IN_CH;++c){ size_t i=(size_t)r*IN_CH+c;
+            ht[i]=f2b(b2f(ht[i])*P.bn_std[c]+P.bn_mean[c]); }
+        cudaMemcpy(P.d_velocity,ht.data(),P.token_elems*2,cudaMemcpyHostToDevice);
+        if(!f2k::cuda::unpatchify_bf16(P.d_velocity,P.d_latent,1,32,P.H_LAT,P.W_LAT,PATCH)) return "";
+        if(!P.vae->forward(P.d_latent,P.d_pixels,P.d_v_ws,P.vae->workspace_size_bytes())) return "";
+        cudaDeviceSynchronize();
+        const int H=P.vae->output_H(), W=P.vae->output_W();
+        std::vector<__nv_bfloat16> hp(P.pixel_elems);
+        cudaMemcpy(hp.data(),P.d_pixels,P.pixel_elems*2,cudaMemcpyDeviceToHost);
+        std::vector<uint8_t> rgb((size_t)H*W*3);
+        for(int h=0;h<H;++h)for(int w=0;w<W;++w)for(int c=0;c<3;++c){
+            float v=b2f(hp[(size_t)(c*H+h)*W+w]); v=std::min(1.f,std::max(0.f,(v+1.f)*0.5f));
+            rgb[((size_t)h*W+w)*3+c]=(uint8_t)(v*255.f+0.5f); }
+        int tw=W, th=H;
+        if(std::max(W,H)>maxdim){ float s=(float)maxdim/std::max(W,H);
+            tw=std::max(1,(int)(W*s)); th=std::max(1,(int)(H*s)); }
+        std::vector<uint8_t> small;
+        const uint8_t* src=rgb.data();
+        if(tw!=W||th!=H){ small.resize((size_t)tw*th*3);
+            stbir_resize_uint8_linear(rgb.data(),W,H,0,small.data(),tw,th,0,STBIR_RGB); src=small.data(); }
+        std::vector<uint8_t> jpg; jpg.reserve((size_t)tw*th);
+        stbi_write_jpg_to_func(png_collect,&jpg,tw,th,3,src,82);   // JPEG: ~10× smaller than PNG
+        ow=tw; oh=th;
+        return b64encode(jpg.data(),jpg.size());
+    }
+
+    json generate(const json& req, const std::function<void(const json&)>& emit){
         std::string prompt=req.value("prompt",""); int res=req.value("res",1024);
         std::string precision=req.value("precision","fp8"); int steps=req.value("steps",4);
         uint32_t seed=(uint32_t)req.value("seed",(int64_t)0);
@@ -277,6 +327,9 @@ struct Worker {
 
         // denoise
         auto dl=Clock::now();
+        const bool stream=req.value("stream",false);
+        const int n_run=steps-i_start;
+        const int prev_every=std::max(1,n_run/4);
         for(int i=i_start;i<steps;++i){
             auto ht=f2k::cuda::compute_timestep_embedding(sched.t(i)*1000.0f,TIME_DIM);
             cudaMemcpy(d_temb,ht.data(),TIME_DIM*2,cudaMemcpyHostToDevice);
@@ -284,6 +337,14 @@ struct Worker {
                 return json{{"ok",false},{"error",std::string("step: ")+P.model->last_error()}};
             if(!f2k::cuda::axpy_bf16(P.d_tokens,P.d_velocity,sched.dt(i),P.token_elems))
                 return json{{"ok",false},{"error","axpy"}};
+            if(stream && emit){
+                int k=i-i_start;
+                if((k+1)%prev_every==0 || k==n_run-1){
+                    int ow=0,oh=0; std::string b=preview_b64(P,384,ow,oh);
+                    if(!b.empty()) emit(json{{"event","progress"},{"step",k+1},{"total",n_run},
+                                            {"w",ow},{"h",oh},{"img_b64",b}});
+                }
+            }
         }
         cudaDeviceSynchronize();
         timing.push_back("denoise "+std::to_string(since(dl)).substr(0,4)+"s ("+std::to_string(steps-i_start)+" steps)");
@@ -340,8 +401,10 @@ int main(int argc,char**argv){
     while(true){
         int fd=accept(srv,nullptr,nullptr); if(fd<0) continue;
         std::string line; json resp;
+        // emit writes one '\n'-delimited JSON line (progress events) to the client.
+        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!write(fd,s.data(),s.size()); };
         if(read_line(fd,line)){
-            try { resp=w.generate(json::parse(line)); }
+            try { resp=w.generate(json::parse(line), emit); }
             catch(const std::exception& e){ resp=json{{"ok",false},{"error",std::string("parse/exec: ")+e.what()}}; }
         } else resp=json{{"ok",false},{"error","empty request"}};
         std::string out=resp.dump()+"\n"; (void)!write(fd,out.data(),out.size()); close(fd);
