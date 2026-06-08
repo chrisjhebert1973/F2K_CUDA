@@ -18,6 +18,7 @@
 #include "backend/cuda/qwen_encoder.h"
 #include "backend/cuda/sampler.h"
 #include "backend/cuda/vae_decoder.h"
+#include "backend/cuda/vae_encoder.h"
 #include "backend/cuda/kernels/patchify.h"
 #include "common/bpe_tokenizer.h"
 #include "common/f2k_format.h"
@@ -30,6 +31,11 @@
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#define STBIR_NO_SIMD          // arm_neon.h intrinsics don't compile under nvcc
+#include "stb_image_resize2.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -67,6 +73,30 @@ bool write_png(const std::string& path, const float* rgb_chw, int H, int W){
     return stbi_write_png(path.c_str(), W, H, 3, b.data(), W*3)!=0;
 }
 
+// Load an image, resize to res×res, return BF16 [3,res,res] in model space
+// [-1,1] (the inverse of write_png's (v+1)/2 encode). Errors → false.
+bool load_image_bf16(const std::string& path, int res,
+                     std::vector<__nv_bfloat16>& out, std::string& err){
+    int w=0,h=0,n=0;
+    uint8_t* px=stbi_load(path.c_str(),&w,&h,&n,3);   // force RGB
+    if(!px){ err="load "+path+": "+stbi_failure_reason(); return false; }
+    std::vector<uint8_t> rgb;
+    const uint8_t* src=px;
+    if(w!=res || h!=res){
+        rgb.resize((size_t)res*res*3);
+        if(!stbir_resize_uint8_linear(px,w,h,0, rgb.data(),res,res,0, STBIR_RGB)){
+            stbi_image_free(px); err="resize failed"; return false; }
+        src=rgb.data();
+    }
+    out.resize((size_t)3*res*res);
+    for(int y=0;y<res;++y)for(int x=0;x<res;++x)for(int c=0;c<3;++c){
+        float v=src[((size_t)y*res+x)*3+c]/255.f*2.f-1.f;     // [0,255]→[-1,1]
+        out[((size_t)c*res+y)*res+x]=f2b(v);                  // → CHW
+    }
+    stbi_image_free(px);
+    return true;
+}
+
 // Resolution/precision-dependent resident pipeline (transformer + VAE + buffers).
 struct Pipeline {
     int res=0; std::string precision;
@@ -75,13 +105,16 @@ struct Pipeline {
     std::unique_ptr<f2k::cuda::FluxTransformer> model;
     std::unique_ptr<f2k::F2KReader> vae_r;
     std::unique_ptr<f2k::cuda::VAEDecoder> vae;
+    std::unique_ptr<f2k::cuda::VAEEncoder> venc;   // img2img: image → latent
     int H_LAT=0,W_LAT=0,SEQ_IMG=0,H_P=0,W_P=0;
-    size_t latent_elems=0, token_elems=0, pixel_elems=0;
+    size_t latent_elems=0, token_elems=0, pixel_elems=0, moment_elems=0;
     void *d_latent=nullptr,*d_tokens=nullptr,*d_velocity=nullptr,*d_pixels=nullptr;
     void *d_t_ws=nullptr,*d_v_ws=nullptr;
+    void *d_init_pix=nullptr,*d_moments=nullptr,*d_e_ws=nullptr;   // encoder I/O + ws
     std::vector<float> bn_mean, bn_std;   // [IN_CH]
 
-    ~Pipeline(){ for(void* p:{d_latent,d_tokens,d_velocity,d_pixels,d_t_ws,d_v_ws}) if(p) cudaFree(p); }
+    ~Pipeline(){ for(void* p:{d_latent,d_tokens,d_velocity,d_pixels,d_t_ws,d_v_ws,
+                              d_init_pix,d_moments,d_e_ws}) if(p) cudaFree(p); }
 };
 
 // Resident, resolution-independent state.
@@ -144,6 +177,11 @@ struct Worker {
         vc.prefix="decoder"; vc.reader=p->vae_r.get();
         p->vae=std::make_unique<f2k::cuda::VAEDecoder>(vc);
         if(!p->vae->ok()){ err=std::string("vae: ")+p->vae->last_error(); return false; }
+        // VAE encoder (img2img): same vae.f2k1, "encoder" prefix.
+        f2k::cuda::VAEEncoder::Config ec{}; ec.N=1; ec.H_in=res; ec.W_in=res;
+        ec.prefix="encoder"; ec.reader=p->vae_r.get();
+        p->venc=std::make_unique<f2k::cuda::VAEEncoder>(ec);
+        if(!p->venc->ok()){ err=std::string("vae enc: ")+p->venc->last_error(); return false; }
         // bn de-norm stats
         const f2k::TensorView* bm=p->vae_r->find("bn.running_mean");
         const f2k::TensorView* bv=p->vae_r->find("bn.running_var");
@@ -156,10 +194,14 @@ struct Worker {
         p->latent_elems=(size_t)32*p->H_LAT*p->W_LAT;
         p->token_elems =(size_t)p->SEQ_IMG*IN_CH;
         p->pixel_elems =(size_t)3*p->vae->output_H()*p->vae->output_W();
+        p->moment_elems=(size_t)64*p->H_LAT*p->W_LAT;
         cudaMalloc(&p->d_latent,p->latent_elems*2); cudaMalloc(&p->d_tokens,p->token_elems*2);
         cudaMalloc(&p->d_velocity,p->token_elems*2); cudaMalloc(&p->d_pixels,p->pixel_elems*2);
         cudaMalloc(&p->d_t_ws,p->model->workspace_size_bytes());
         cudaMalloc(&p->d_v_ws,p->vae->workspace_size_bytes());
+        cudaMalloc(&p->d_init_pix,(size_t)3*res*res*2);
+        cudaMalloc(&p->d_moments,p->moment_elems*2);
+        cudaMalloc(&p->d_e_ws,p->venc->workspace_size_bytes());
         std::fprintf(stderr,"[worker] pipeline %dpx/%s built in %.1fs\n",res,precision.c_str(),since(t));
         pipe=std::move(p); return true;
     }
@@ -169,10 +211,14 @@ struct Worker {
         std::string precision=req.value("precision","fp8"); int steps=req.value("steps",4);
         uint32_t seed=(uint32_t)req.value("seed",(int64_t)0);
         std::string out=req.value("out","");
+        std::string init_image=req.value("init_image","");   // img2img source (abs path)
+        float strength=req.value("strength",0.6f);           // 0..1; only used w/ init_image
         std::vector<std::string> timing; std::string err;
         auto t_all=Clock::now();
         if(precision!="fp8"&&precision!="nvfp4") precision="fp8";
         steps=std::max(1,std::min(30,steps));
+        strength=std::max(0.05f,std::min(1.0f,strength));
+        const bool img2img=!init_image.empty();
         if(!ensure(res,precision,err)) return json{{"ok",false},{"error",err}};
         Pipeline& P=*pipe;
 
@@ -185,18 +231,53 @@ struct Worker {
         cudaDeviceSynchronize();
         timing.push_back("text encode "+std::to_string((int)(since(te)*1000))+"ms");
 
-        // initial N(0,1) latent
+        // schedule; for img2img we start partway down it (less noise).
+        auto sched=f2k::cuda::FlowMatchScheduler::flux2_dynamic(steps,P.SEQ_IMG);
+        int i_start=0;
+        if(img2img){
+            int n_run=std::max(1,std::min(steps,(int)std::lround((double)steps*strength)));
+            i_start=steps-n_run;
+        }
+
+        // build the starting latent tokens in P.d_tokens
         std::mt19937 rng(seed); std::normal_distribution<float> dn(0,1);
-        std::vector<__nv_bfloat16> hl(P.latent_elems);
-        for(auto& v:hl) v=f2b(dn(rng));
-        cudaMemcpy(P.d_latent,hl.data(),P.latent_elems*2,cudaMemcpyHostToDevice);
-        if(!f2k::cuda::patchify_bf16(P.d_latent,P.d_tokens,1,32,P.H_LAT,P.W_LAT,PATCH))
-            return json{{"ok",false},{"error","patchify"}};
+        if(!img2img){
+            // text-to-image: pure N(0,1) latent → patchify
+            std::vector<__nv_bfloat16> hl(P.latent_elems);
+            for(auto& v:hl) v=f2b(dn(rng));
+            cudaMemcpy(P.d_latent,hl.data(),P.latent_elems*2,cudaMemcpyHostToDevice);
+            if(!f2k::cuda::patchify_bf16(P.d_latent,P.d_tokens,1,32,P.H_LAT,P.W_LAT,PATCH))
+                return json{{"ok",false},{"error","patchify"}};
+        } else {
+            // image-to-image: encode init → mean latent → patchify → bn-normalize,
+            // then noise to t0 via flow-match interp  x_t = (1-t0)*x0 + t0*noise.
+            auto ie=Clock::now();
+            std::vector<__nv_bfloat16> hi;
+            if(!load_image_bf16(init_image,res,hi,err))
+                return json{{"ok",false},{"error",err}};
+            cudaMemcpy(P.d_init_pix,hi.data(),hi.size()*2,cudaMemcpyHostToDevice);
+            if(!P.venc->forward(P.d_init_pix,P.d_moments,P.d_e_ws,P.venc->workspace_size_bytes()))
+                return json{{"ok",false},{"error",std::string("vae enc: ")+P.venc->last_error()}};
+            // mean = first 32 channels of the moments tensor → patchify
+            if(!f2k::cuda::patchify_bf16(P.d_moments,P.d_tokens,1,32,P.H_LAT,P.W_LAT,PATCH))
+                return json{{"ok",false},{"error","enc patchify"}};
+            cudaDeviceSynchronize();
+            std::vector<__nv_bfloat16> x0(P.token_elems);
+            cudaMemcpy(x0.data(),P.d_tokens,P.token_elems*2,cudaMemcpyDeviceToHost);
+            const float t0=sched.t(i_start);
+            std::vector<__nv_bfloat16> xt(P.token_elems);
+            for(int r=0;r<P.SEQ_IMG;++r)for(int c=0;c<IN_CH;++c){ size_t i=(size_t)r*IN_CH+c;
+                float clean=(b2f(x0[i])-P.bn_mean[c])/P.bn_std[c];   // → transformer space
+                xt[i]=f2b((1.f-t0)*clean + t0*dn(rng));
+            }
+            cudaMemcpy(P.d_tokens,xt.data(),P.token_elems*2,cudaMemcpyHostToDevice);
+            timing.push_back("img2img encode "+std::to_string((int)(since(ie)*1000))+
+                             "ms (str "+std::to_string(strength).substr(0,3)+")");
+        }
 
         // denoise
         auto dl=Clock::now();
-        auto sched=f2k::cuda::FlowMatchScheduler::flux2_dynamic(steps,P.SEQ_IMG);
-        for(int i=0;i<steps;++i){
+        for(int i=i_start;i<steps;++i){
             auto ht=f2k::cuda::compute_timestep_embedding(sched.t(i)*1000.0f,TIME_DIM);
             cudaMemcpy(d_temb,ht.data(),TIME_DIM*2,cudaMemcpyHostToDevice);
             if(!P.model->forward(P.d_tokens,d_txt,d_temb,P.d_velocity,P.d_t_ws,P.model->workspace_size_bytes()))
@@ -205,7 +286,7 @@ struct Worker {
                 return json{{"ok",false},{"error","axpy"}};
         }
         cudaDeviceSynchronize();
-        timing.push_back("denoise "+std::to_string(since(dl)).substr(0,4)+"s ("+std::to_string(steps)+" steps)");
+        timing.push_back("denoise "+std::to_string(since(dl)).substr(0,4)+"s ("+std::to_string(steps-i_start)+" steps)");
 
         // bn de-norm (host) → unpatchify
         std::vector<__nv_bfloat16> ht(P.token_elems);
