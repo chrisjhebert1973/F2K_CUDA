@@ -63,6 +63,7 @@ possible:
 | `tools/diffusers_prompt_embeds.py` (→ `--embeds`) | diffusers `[512×12288]` conditioning | transformer with known-good text |
 | `tools/cmp_transformer.cu` + `diffusers_block_dump.py` | one transformer forward vs diffusers | transformer (cos 0.963 NVFP4 / 0.999 MXFP8) |
 | `tools/diffusers_latent_dump.py` (→ `--decode_latent`) | diffusers ground-truth latent | VAE decoder in isolation |
+| `tools/diffusers_vae_encode_dump.py` + `cmp_vae_encode.cu` | diffusers posterior-mean latent | VAE **encoder** (cos 0.9997, 256–2048px; Ch 26) |
 | `tools/diffusers_e2e.py` | full diffusers pipeline image | end-to-end ground truth |
 | `tools/probe_ctx_emb.cu` | per-row cos of ContextEmbedder in/out | text-side Linear ablations |
 | `tools/quant_sim.py` | PyTorch fake-quant quality study | the FP4-vs-FP8 quality question (Ch 12) |
@@ -172,9 +173,11 @@ FP32 at cos 1.0 — not a regression.
   post_quant_conv/bn-de-norm (mush/grid) — were each localized by injecting a
   reference intermediate and diffing at the latent boundary.
 
-This closes Part VII and the main course. The appendices follow: a glossary (A), the
-bug museum (B) collecting every war story with its lesson, and the build & reproduce
-guide (C).
+This closes Part VII — the text-to-image pipeline, proven correct. **Part VIII** then
+goes beyond it: the VAE encoder (Chapter 26) that closes the autoencoder loop, the
+image-conditioning techniques it unlocks (Chapter 27 — img2img, inpainting,
+upscaling), and the serving layer that streams it live (Chapter 28). The appendices
+follow: a glossary (A), the bug museum (B), and the build & reproduce guide (C).
 
 ---
 
@@ -191,4 +194,4 @@ guide (C).
 4. **The structured-test trap.** Explain how the CuTe layout bug passed all-ones and
    K-constant tests, and write the random-input test that catches it (Chapter 13).
 
-*Next: [Appendix A — Glossary](A-glossary.md).*
+*Next: [Chapter 26 — Assembling the VAE encoder](26-vae-encoder.md), opening Part VIII.*

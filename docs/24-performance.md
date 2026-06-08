@@ -30,6 +30,15 @@ Notice the levers are all *different*: an occupancy limit, a dependency
 misconfiguration, a redundant recomputation, and a wrong runtime entirely. There is
 no single trick — each required *diagnosing the specific cause*.
 
+**Part VIII costs, for reference.** Image conditioning (Chapter 27) adds a VAE
+encode: ~0.1 s at 512px, dominated by the same convs as decode. The live-preview
+stream (Chapter 28) decodes ~4 low-res JPEGs per run at ~40 KB each — a small,
+bounded tax for watching the image form. The one *expensive* mode is **2048px (true
+2K)**: ~80–90 s, because the denoise is $O(S^2)$ at sequence length ~16 896 (≈14.5 s
+per step) plus ~15 s each for VAE encode and decode. That is the honest state — 2K
+is *correct but unoptimized*; it is the clearest remaining target, and the same
+roofline discipline (the attention is again the bandwidth-bound bottleneck) applies.
+
 ## 24.2 The core discipline: measure the ceiling first
 
 The throughline, stated once: **before optimizing, determine which ceiling a kernel

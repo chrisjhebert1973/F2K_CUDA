@@ -232,6 +232,9 @@ files and never parses anything on the hot path. Chapters 12 (the formats) and 1
 - If you came for the **attention optimization** specifically (the headline
   engineering result): Part IV (Chapters 16–18) is self-contained enough to read
   on its own, given this overview.
+- If you came for **what you can do with it** beyond text-to-image: Part VIII
+  (Chapters 26–28) adds the VAE encoder, image conditioning (img2img / inpainting /
+  upscaling), and the streaming serving layer.
 
 Either way, keep §0.6 in mind. Everything bends toward bandwidth.
 

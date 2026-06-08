@@ -165,6 +165,54 @@
   don't compile — half the alphabet isn't a hex digit. Use real hex (`0xCAFEBABE`) or a
   number.
 
+## B.15 The `gridDim.y` overflow at 65 536 (the "2K needs too much memory" red herring)
+
+- **Symptom.** Anything at **2048px** — native generation, img2img encode, upscale — failed,
+  inside `Linear` at the VAE mid-attention's `to_q` ("activation quant launch failed").
+  1536px was fine. It read like an out-of-memory wall at 2K.
+- **Cause.** Not memory — a **launch-config limit**. `Linear`'s activation-quant and
+  bias-add kernels launched with `grid.y = M` (the row count). CUDA caps **`gridDim.y` at
+  65 535**. The VAE spatial attention runs at $S=(res/8)^2$ tokens, so $M=65536$ at *exactly*
+  2048px (and 36 864 at 1536 — just under). An off-by-one against a hardware ceiling, masked
+  by a memory-shaped guess.
+- **Fix.** Carry rows past 65 535 onto `grid.z`: `row = blockIdx.y + blockIdx.z*gridDim.y`,
+  launched as `dim3(n, min(M,65535), ceil(M/65535))`. A no-op for $M<65536$ (`gz=1`), so zero
+  risk to the common path.
+- **Result.** Native **2048 (true 2K)** works for encoder, decoder, and generation; the
+  encoder golden gained its 2048 row (cos **0.99960**).
+- **Lesson.** Hardware launch-config limits (`gridDim.{y,z} ≤ 65535`) are invisible until a
+  dimension crosses them. Unlike most museum bugs this one *crashed* — but the crash's
+  neighbourhood ("memory at 2K") misdirected; the real tell was that it failed at one exact
+  resolution. Suspect grid shape when a kernel dies at a round power-of-two size. (Ch 13, 26, 27)
+
+## B.16 The streaming form that downloaded itself
+
+- **Symptom.** Tapping Generate / Remix / Inpaint **downloaded a file** `generate_stream.ndjson`
+  instead of showing the live preview.
+- **Cause.** `streamSubmit` is an `async` function, so it returns a **Promise**. Wired as
+  `onsubmit="return streamSubmit(this)"`, the handler returned a *truthy* Promise, which does
+  **not** cancel a form's native submit — the browser POSTed to the streaming endpoint and
+  saved its NDJSON body as a download. The error fallback then called `form.submit()`, causing
+  the same download a second way.
+- **Fix.** Cancel the default **synchronously**: `onsubmit="streamSubmit(this); return false"`
+  (and `inpaintSubmit` returns `false` after firing the stream). Drop the native-submit
+  fallback; alert on error instead.
+- **Lesson.** `async` functions and `onsubmit`'s return-value contract don't mix — a Promise is
+  truthy, and only a *synchronous* `return false` prevents default. (Ch 28)
+
+## B.17 `SIGPIPE` — a closed tab killing the GPU
+
+- **Symptom.** The persistent worker exited (code **141**) when a browser disconnected during
+  a streaming job.
+- **Cause.** Streaming makes the worker **write to the client repeatedly** mid-job. A
+  disconnected client means the next `write` hits a closed socket, and the OS raises
+  **`SIGPIPE`**, whose default action *terminates the process*. Closing a tab killed the server.
+- **Fix.** `signal(SIGPIPE, SIG_IGN)` at startup; `write` then returns `EPIPE`, the job
+  finishes, the worker keeps serving.
+- **Lesson.** Any long-lived server that *streams* to clients must ignore `SIGPIPE`. The bug
+  cannot occur in plain request/response (one write, at the end) — adding a streaming
+  interface created a new failure class at the client boundary. (Ch 28)
+
 ---
 
 ## The patterns across all of them
@@ -185,3 +233,8 @@
 6. **Performance bugs are silent too.** B.10, B.11 produced *correct* output at terrible
    speed; only a reference *number* revealed them.
 7. **Random inputs in tests.** B.5 hid behind structured tests; random data caught it.
+8. **New interfaces create new failure classes.** The bugs that *do* crash cluster at
+   boundaries the core never had: a hardware launch limit at a new resolution (B.15), and a
+   browser/socket boundary that only exists once you stream (B.16, B.17). When you add a
+   dimension — bigger images, a streaming client — re-test the *edges* of it, not just the
+   happy path.

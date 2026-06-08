@@ -50,7 +50,11 @@ steps; the MMDiT architecture (joint text/image attention, AdaLN modulation,
 NVFP4/MXFP8 block-scaled quantization, CUTLASS tensor-core GEMM, a flash-attention
 kernel taken all the way to peak HBM bandwidth with `mma.sync`/`ldmatrix`, the
 cuDNN-9 graph API for convolutions, a from-scratch byte-level BPE tokenizer, and
-the orchestration that ties it together.
+the orchestration that ties it together. Part VIII then goes *beyond* text-to-image:
+the **VAE encoder** closes the autoencoder loop, which unlocks **img2img,
+inpainting, and upscaling** (all one idea — denoise from a noised real latent), and
+a **persistent worker + streaming web UI** serve it interactively, watching the
+image form live from a phone.
 
 ## The target machine
 
@@ -142,10 +146,20 @@ chapters as reference and live in the implementation chapters.
 - **25 — Validation methodology** — golden tests against diffusers, cosine
   similarity, bit-exactness, and the debugging sagas that hardened the pipeline.
 
+### Part VIII — Image conditioning & serving
+- **26 — The VAE encoder** — the mirror of Chapter 20 that closes the autoencoder
+  loop (image → latent), the asymmetric downsample pad, verified at cos 0.9997.
+- **27 — Image conditioning** — img2img, inpainting, and upscaling as one idea:
+  start the flow-matching denoise from a *noised real latent*. Strength schedules,
+  RePaint masking, the hi-res pass.
+- **28 — Serving & live preview** — the persistent worker (resident models, a
+  line protocol), the web UI over Tailscale, and streaming the image as it forms.
+
 ### Appendices
 - **A — Glossary** of every term and acronym.
 - **B — The bug museum** — the real bugs (modulation scale/shift swap, the VAE
-  "mush", the FP4 layout trap) and what each one teaches.
+  "mush", the FP4 layout trap, the `gridDim.y` 2K wall, the streaming `SIGPIPE`)
+  and what each one teaches.
 - **C — Build & reproduce** — toolchain, CMake, running the tests, regenerating
   every figure and number in the course.
 
@@ -158,5 +172,7 @@ possible, to a passing test under `tests/`. Performance numbers were measured on
 the GB10 described above with `tools/bench_attention.cu` and `tools/generate.cu`.
 When the course says "we measured X," there is a way to reproduce X in Appendix C.
 
-> Status: **complete** — all 26 chapters (00–25) and three appendices (A–C) are
-> written, each anchored to the source and verified against it.
+> Status: **complete** — all 29 chapters (00–28) and three appendices (A–C) are
+> written, each anchored to the source and verified against it. Parts 0–VII cover
+> text-to-image; Part VIII adds the VAE encoder, image conditioning (img2img /
+> inpainting / upscaling), and the serving layer with live preview.

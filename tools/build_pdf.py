@@ -16,7 +16,7 @@ COVER = os.path.join(ROOT, "imgs", "rocket_route66.png")
 OUT = os.path.join(ROOT, "F2K_CUDA_course.pdf")
 FONTDIR = "/usr/share/fonts/truetype/dejavu"
 
-ORDER = (["README.md"] + [f"{i:02d}-*.md" for i in range(26)] +
+ORDER = (["README.md"] + [f"{i:02d}-*.md" for i in range(29)] +
          ["A-glossary.md", "B-bug-museum.md", "C-build-reproduce.md"])
 
 # ---------------------------------------------------------------- math → unicode

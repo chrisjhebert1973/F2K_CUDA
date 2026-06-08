@@ -102,6 +102,24 @@ Produce them from a HF download with `f2k_convert` (Chapter 12/14):
 PPM output is the default; an `.png` extension writes PNG (Chapter 22). PPM→PNG if
 needed: `.venv/bin/python -c "from PIL import Image; Image.open('out.ppm').save('out.png')"`.
 
+`--res` now accepts up to **2048** (true 2K, Chapter 27); 2K is correct but slow
+(~80–90 s, Chapter 24).
+
+### Serve it (persistent worker + web UI, Chapter 28)
+
+```bash
+# one-time: build the worker target
+cmake --build build --target serve
+
+# launch worker (resident models) + Flask UI; reach it over Tailscale
+F2K_WEB_PASSWORD=yourpw tools/webui/start.sh        # → http://<host>:5000
+```
+
+The worker holds the models resident (~8 s/image vs ~25 s one-shot) and serves
+txt2img, img2img, inpaint, upscale, and photo upload — with **live preview**
+streaming as the image forms. `init_image`/`mask_image`/`strength` are worker
+request fields (the image-conditioning paths of Chapter 27), not `generate` flags.
+
 ## C.7 Run the tests
 
 ```bash
@@ -124,6 +142,7 @@ Expected: all green; `test_tokenizer` prints `ALL OK`; `test_attention` shows
 | Qwen3 encoder cos ≥0.974 vs HF (21, 25) | `tools/qwen3_golden.py` + `./build/test_qwen_golden` |
 | FP4-vs-FP8 quality 12.95%/2.12% (12) | `.venv/bin/python tools/quant_sim.py` |
 | VAE decode timing, decode diffusers latent (19, 20, 25) | `./build/test_vae_decoder`; `generate --decode_latent` |
+| VAE **encoder** cos 0.9997 vs diffusers (26) | `tools/diffusers_vae_encode_dump.py --image X --size N`; `./build/cmp_vae_encode /tmp/vae_enc_img.bin /tmp/vae_enc_lat.bin` |
 | full timing ledger (0, 23) | `./build/generate --prompt ... --res 1024 --precision fp8` (reads the stderr timings) |
 
 `bench_attention` prints the device properties (SMs, opt-in smem, peak) at startup,
