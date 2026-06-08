@@ -137,10 +137,11 @@ def _subprocess_call(out_png, prompt, res, precision, steps, seed):
     return dict(ok=(proc.returncode == 0 and os.path.exists(out_png)), timing=timing,
                 error=(log[-1500:] if proc.returncode != 0 else ""))
 
-def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None):
+def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None, kind=None):
     """Generate len(seeds) images for one prompt, serialised on the GPU lock.
     If init_image (abs path) is given, runs img2img at the given strength — only
-    the persistent worker supports this; the subprocess fallback is txt2img."""
+    the persistent worker supports this; the subprocess fallback is txt2img.
+    `kind` tags the run (e.g. 'upscale 2048px') for the result banner."""
     rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
     images, mode, err = [], "worker", ""
     t0 = time.time()
@@ -169,6 +170,8 @@ def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=No
     if init_image:
         meta["init_from"] = os.path.basename(init_image)
         meta["strength"] = strength
+    if kind:
+        meta["kind"] = kind
     save_run(meta)
     return meta
 
@@ -283,6 +286,30 @@ def upload_remix():
                      init_image=init_path, strength=round(strength, 2))
     return redirect(url_for("result", rid=meta["id"]))
 
+# 1536 is the current ceiling: at 2048 the VAE mid-block attention (latent 256²
+# = 65536 tokens) exceeds what the Linear/attention kernels handle. 1024→1536.
+UPSCALE_MAX = 1536
+UPSCALE_STRENGTH = 0.35   # low: add detail at higher res, keep the content
+
+@app.route("/upscale/<rid>/<int:idx>", methods=["POST"])
+@login_required
+def upscale(rid, idx):
+    m = load_run(rid)
+    if not m or idx < 0 or idx >= len(m["images"]): abort(404)
+    im = m["images"][idx]
+    if not im.get("ok"): abort(404)
+    init_path = os.path.join(RUNS, os.path.basename(im["file"]))
+    if not os.path.exists(init_path): abort(404)
+    src_res = int(m.get("res", 1024))
+    target = min(src_res * 2, UPSCALE_MAX)
+    if target <= src_res:
+        flash("Already at the maximum size."); return redirect(url_for("result", rid=rid))
+    steps = max(int(m.get("steps", 8)), 12)        # a few more steps help at 2K
+    seeds = [im.get("seed", secrets.randbits(32))]  # reuse seed for consistency
+    meta = run_batch(m.get("prompt", ""), target, m.get("precision", "fp8"), steps, seeds,
+                     init_image=init_path, strength=UPSCALE_STRENGTH, kind=f"upscale {target}px")
+    return redirect(url_for("result", rid=meta["id"]))
+
 @app.route("/delete/<rid>/<int:idx>", methods=["POST"])
 @login_required
 def delete(rid, idx):
@@ -337,11 +364,12 @@ img.gen{width:100%;border-radius:12px;display:block;background:#000}
 .meta code{color:#9fe0a0} .muted{color:#8a8f9c;font-size:13px}
 .tile{background:#1d2026;border:1px solid #2c3038;border-radius:12px;overflow:hidden}
 .tile img{width:100%;display:block}
-.tile .bar{display:flex;gap:8px;padding:8px}
+.tile .bar{display:flex;gap:8px;padding:8px;flex-wrap:wrap}
 .tile .bar form{flex:1;margin:0} .tile .bar button{margin:0;padding:9px;font-size:13px;border-radius:9px;width:100%}
 .tile .bar .btn{flex:1;display:block;text-align:center;padding:9px;font-size:13px;border-radius:9px;
  background:#3b6cf0;color:#fff;font-weight:600}
 .del{background:#5a2330} .del:active{background:#46101c}
+.up{background:#1f7a6a} .up:active{background:#155448}
 .thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;border:1px solid #2c3038}
 output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
 .tile img{cursor:zoom-in}
@@ -405,18 +433,22 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 </div>""".replace("{{css}}", BASE_CSS)
 
 RESULT = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>F2K · result</title><style>{{css}}</style><div class=wrap>
+<title>F2K · result</title><style>{{css}}</style>
+<div id=ov><div class=spin></div><div>Working…<br><span class=muted id=ovsub>upscaling · ~40s</span></div></div>
+<div class=wrap>
 <header><h1><a href="{{url_for('index')}}">← New</a></h1><a href="{{url_for('gallery')}}">Gallery</a></header>
 {% with msg=get_flashed_messages() %}{% if msg %}<div class=flash>{{msg[0]}}</div>{% endif %}{% endwith %}
 {% if not m.ok %}<div class=flash>Generation failed.<pre style="white-space:pre-wrap;font-size:12px">{{m.error}}</pre></div>{% endif %}
 {% if m.init_from %}<div class=meta style="margin-bottom:10px;display:flex;gap:10px;align-items:center">
 <img src="{{url_for('img',fn=m.init_from)}}" style="width:56px;height:56px;object-fit:cover;border-radius:8px" onerror="this.style.display='none'">
-<span class=muted>🎨 Remixed from this · strength {{m.strength}}</span></div>{% endif %}
+<span class=muted>{% if m.kind and m.kind.startswith('upscale') %}⬆ Upscaled from this · {{m.kind}}{% else %}🎨 Remixed from this · strength {{m.strength}}{% endif %}</span></div>{% endif %}
 <div class=grid>
 {% for im in m.images %}<div class=tile>
  {% if im.ok %}<img src="{{url_for('img',fn=im.file)}}" onclick="showLB(this.src)">{% else %}<div class=c style="padding:24px;text-align:center">failed</div>{% endif %}
  <div class=bar>
-  {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>{% endif %}
+  {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>
+  {% if m.res < 1536 %}<form method=post action="{{url_for('upscale',rid=m.id,idx=loop.index0)}}" onsubmit="document.getElementById('ov').style.display='flex'">
+   <button class=up title="Upscale">Upscale</button></form>{% endif %}{% endif %}
   <form method=post action="{{url_for('delete',rid=m.id,idx=loop.index0)}}" onsubmit="return confirm('Delete this image?')">
    <button class=del>Delete</button></form>
  </div>
