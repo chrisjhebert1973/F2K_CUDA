@@ -173,6 +173,7 @@ if(F2K_ENABLE_CUDA)
         src/backend/cuda/vae_resnet.cu
         src/backend/cuda/vae_attn.cu
         src/backend/cuda/vae_decoder.cu
+        src/backend/cuda/vae_encoder.cu
         src/backend/cuda/kernels/transpose_chw.cu
         src/backend/cuda/kernels/patchify.cu
         src/backend/cuda/kernels/embed_lookup.cu
@@ -312,6 +313,9 @@ if(F2K_ENABLE_CUDA)
 
     add_executable(cmp_transformer tools/cmp_transformer.cu)
     target_link_libraries(cmp_transformer PRIVATE f2k_cuda f2k_common)
+
+    add_executable(cmp_vae_encode tools/cmp_vae_encode.cu)
+    target_link_libraries(cmp_vae_encode PRIVATE f2k_cuda f2k_common)
 
     add_executable(test_vae_decoder tests/test_vae_decoder.cu)
     target_link_libraries(test_vae_decoder PRIVATE f2k_cuda f2k_common)
