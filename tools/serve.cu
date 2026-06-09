@@ -490,16 +490,28 @@ int main(int argc,char**argv){
     int port=8765;
     for(int i=1;i<argc;++i){ std::string a=argv[i];
         if(a=="--port"&&i+1<argc) port=std::atoi(argv[++i]); }
-    Worker w; std::string err;
-    std::fprintf(stderr,"[worker] loading resident models...\n");
-    if(!w.init(err)){ std::fprintf(stderr,"[worker] init failed: %s\n",err.c_str()); return 1; }
-
+    // Bind FIRST, before the ~12s model load: a port clash should fail fast and
+    // not waste 12s + ~14GB of VRAM. (A stale serve.exe still holding the port is
+    // the usual cause — note SO_REUSEADDR won't override an actively-bound port.)
     sock_t srv=socket(AF_INET,SOCK_STREAM,0); int yes=1;
     setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const char*>(&yes),sizeof(yes));
     sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(port);
     addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);   // 127.0.0.1 only
-    if(bind(srv,(sockaddr*)&addr,sizeof(addr))<0){ perror("bind"); return 1; }
+    if(bind(srv,(sockaddr*)&addr,sizeof(addr))<0){
+#ifdef _WIN32
+        // Winsock doesn't set errno, so perror() prints a useless "No error".
+        std::fprintf(stderr,"[worker] bind failed on port %d: WSA error %d"
+            " (10048 = port already in use; kill the stale serve.exe)\n", port, WSAGetLastError());
+#else
+        std::fprintf(stderr,"[worker] bind failed on port %d: %s\n", port, std::strerror(errno));
+#endif
+        return 1;
+    }
     listen(srv,4);
+
+    Worker w; std::string err;
+    std::fprintf(stderr,"[worker] loading resident models...\n");
+    if(!w.init(err)){ std::fprintf(stderr,"[worker] init failed: %s\n",err.c_str()); return 1; }
     std::fprintf(stderr,"[worker] ready, listening on 127.0.0.1:%d\n",port);
     while(true){
         sock_t fd=accept(srv,nullptr,nullptr); if(!sock_valid(fd)) continue;
