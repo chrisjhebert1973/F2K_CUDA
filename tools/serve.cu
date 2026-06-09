@@ -33,9 +33,9 @@
 #include "stb_image_write.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#define STBIR_NO_SIMD          // arm_neon.h intrinsics don't compile under nvcc
-#include "stb_image_resize2.h"
+// (stb_image_resize2 intentionally NOT used — its SIMD intrinsics don't compile
+//  cleanly under nvcc on either ARM (arm_neon.h) or MSVC; resize_bilinear below
+//  replaces it for the preview downscale + init-image fit.)
 
 // --- cross-platform TCP sockets (POSIX BSD sockets | Windows Winsock2) ------
 #ifdef _WIN32
@@ -116,6 +116,26 @@ void png_collect(void* ctx, void* data, int size){
     auto* p=static_cast<uint8_t*>(data); v->insert(v->end(), p, p+size);
 }
 
+// Bilinear resize for 8-bit interleaved images (ch channels). Good enough for a
+// preview downscale and an init-image fit; replaces stb_image_resize2.
+void resize_bilinear(const uint8_t* src, int sw, int sh,
+                     uint8_t* dst, int dw, int dh, int ch){
+    for(int y=0;y<dh;++y){
+        const float fy=(dh>1)?(float)y*(sh-1)/(dh-1):0.f;
+        const int y0=(int)fy, y1=std::min(y0+1,sh-1); const float wy=fy-y0;
+        for(int x=0;x<dw;++x){
+            const float fx=(dw>1)?(float)x*(sw-1)/(dw-1):0.f;
+            const int x0=(int)fx, x1=std::min(x0+1,sw-1); const float wx=fx-x0;
+            for(int c=0;c<ch;++c){
+                const float a=src[((size_t)y0*sw+x0)*ch+c], b=src[((size_t)y0*sw+x1)*ch+c];
+                const float d=src[((size_t)y1*sw+x0)*ch+c], e=src[((size_t)y1*sw+x1)*ch+c];
+                const float top=a+(b-a)*wx, bot=d+(e-d)*wx;
+                dst[((size_t)y*dw+x)*ch+c]=(uint8_t)(top+(bot-top)*wy+0.5f);
+            }
+        }
+    }
+}
+
 // Load an image, resize to res×res, return BF16 [3,res,res] in model space
 // [-1,1] (the inverse of write_png's (v+1)/2 encode). Errors → false.
 bool load_image_bf16(const std::string& path, int res,
@@ -127,8 +147,7 @@ bool load_image_bf16(const std::string& path, int res,
     const uint8_t* src=px;
     if(w!=res || h!=res){
         rgb.resize((size_t)res*res*3);
-        if(!stbir_resize_uint8_linear(px,w,h,0, rgb.data(),res,res,0, STBIR_RGB)){
-            stbi_image_free(px); err="resize failed"; return false; }
+        resize_bilinear(px,w,h, rgb.data(),res,res, 3);
         src=rgb.data();
     }
     out.resize((size_t)3*res*res);
@@ -152,8 +171,7 @@ bool load_mask_tokens(const std::string& path, int res, int H_P, int W_P,
     std::vector<uint8_t> g;
     const uint8_t* src=px;
     if(w!=res || h!=res){ g.resize((size_t)res*res);
-        if(!stbir_resize_uint8_linear(px,w,h,0, g.data(),res,res,0, STBIR_1CHANNEL)){
-            stbi_image_free(px); err="mask resize failed"; return false; }
+        resize_bilinear(px,w,h, g.data(),res,res, 1);
         src=g.data(); }
     const int bh=res/H_P, bw=res/W_P;
     m.assign((size_t)H_P*W_P, 0.f);
@@ -301,7 +319,7 @@ struct Worker {
         std::vector<uint8_t> resized;   // (not 'small' — windows.h #defines small=char)
         const uint8_t* src=rgb.data();
         if(tw!=W||th!=H){ resized.resize((size_t)tw*th*3);
-            stbir_resize_uint8_linear(rgb.data(),W,H,0,resized.data(),tw,th,0,STBIR_RGB); src=resized.data(); }
+            resize_bilinear(rgb.data(),W,H, resized.data(),tw,th, 3); src=resized.data(); }
         std::vector<uint8_t> jpg; jpg.reserve((size_t)tw*th);
         stbi_write_jpg_to_func(png_collect,&jpg,tw,th,3,src,82);   // JPEG: ~10× smaller than PNG
         ow=tw; oh=th;
