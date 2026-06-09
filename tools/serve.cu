@@ -39,6 +39,8 @@
 
 // --- cross-platform TCP sockets (POSIX BSD sockets | Windows Winsock2) ------
 #ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX               // don't clobber std::min/std::max with macros
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "ws2_32.lib")
@@ -296,10 +298,10 @@ struct Worker {
         int tw=W, th=H;
         if(std::max(W,H)>maxdim){ float s=(float)maxdim/std::max(W,H);
             tw=std::max(1,(int)(W*s)); th=std::max(1,(int)(H*s)); }
-        std::vector<uint8_t> small;
+        std::vector<uint8_t> resized;   // (not 'small' — windows.h #defines small=char)
         const uint8_t* src=rgb.data();
-        if(tw!=W||th!=H){ small.resize((size_t)tw*th*3);
-            stbir_resize_uint8_linear(rgb.data(),W,H,0,small.data(),tw,th,0,STBIR_RGB); src=small.data(); }
+        if(tw!=W||th!=H){ resized.resize((size_t)tw*th*3);
+            stbir_resize_uint8_linear(rgb.data(),W,H,0,resized.data(),tw,th,0,STBIR_RGB); src=resized.data(); }
         std::vector<uint8_t> jpg; jpg.reserve((size_t)tw*th);
         stbi_write_jpg_to_func(png_collect,&jpg,tw,th,3,src,82);   // JPEG: ~10× smaller than PNG
         ow=tw; oh=th;
