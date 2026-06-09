@@ -143,16 +143,34 @@ endif()
 if(F2K_ENABLE_CUDA)
     # cuDNN — for the VAE convs and norms, reached via the graph API (conv2d.cu).
     if(WIN32)
-        # Windows: cudnn.lib import lib + cudnn64_9.dll at runtime. Look under
-        # CUDNN_ROOT, then the CUDA Toolkit. Headers ship alongside.
-        find_library(CUDNN_LIB NAMES cudnn
-            HINTS ${CUDNN_ROOT} $ENV{CUDNN_ROOT} $ENV{CUDA_PATH}
-            PATH_SUFFIXES lib lib/x64 lib/12.x/x64)
-        find_path(CUDNN_INCLUDE_DIRS cudnn.h
-            HINTS ${CUDNN_ROOT} $ENV{CUDNN_ROOT} $ENV{CUDA_PATH}
-            PATH_SUFFIXES include include/12.x)
+        # Windows: cudnn.lib import lib (cudnn64_9.dll + sublibs needed on PATH at
+        # runtime). The cuDNN 9 installer nests by CUDA version:
+        #   <root>\lib\<cudaver>\x64\cudnn.lib  and  <root>\include\<cudaver>\cudnn.h
+        # (cudaver e.g. 13.3, 12.9), or a flat lib\x64 + include. Auto-detect and
+        # prefer the highest <cudaver> (so CUDA-13 wins over CUDA-12). Explicit
+        # -DCUDNN_LIB / -DCUDNN_INCLUDE_DIRS always override.
+        if(NOT CUDNN_LIB OR NOT CUDNN_INCLUDE_DIRS)
+            set(_cudnn_root "${CUDNN_ROOT}")
+            if(NOT _cudnn_root)
+                set(_cudnn_root "$ENV{CUDNN_ROOT}")
+            endif()
+            file(GLOB _cudnn_libs "${_cudnn_root}/lib/*/x64/cudnn.lib"
+                                  "${_cudnn_root}/lib/x64/cudnn.lib")
+            file(GLOB _cudnn_incs "${_cudnn_root}/include/*/cudnn.h"
+                                  "${_cudnn_root}/include/cudnn.h")
+            if(_cudnn_libs AND NOT CUDNN_LIB)
+                list(SORT _cudnn_libs)
+                list(GET _cudnn_libs -1 CUDNN_LIB)   # last = highest CUDA-ver dir
+            endif()
+            if(_cudnn_incs AND NOT CUDNN_INCLUDE_DIRS)
+                list(SORT _cudnn_incs)
+                list(GET _cudnn_incs -1 _cudnn_inc)
+                get_filename_component(CUDNN_INCLUDE_DIRS "${_cudnn_inc}" DIRECTORY)
+            endif()
+        endif()
         if(NOT CUDNN_LIB)
-            message(FATAL_ERROR "cuDNN not found. Set -DCUDNN_ROOT=<path to cuDNN 9> (cudnn.lib + headers).")
+            message(FATAL_ERROR "cuDNN not found under CUDNN_ROOT='${CUDNN_ROOT}'. "
+                "Pass -DCUDNN_LIB=<...\\cudnn.lib> and -DCUDNN_INCLUDE_DIRS=<dir with cudnn.h>.")
         endif()
     else()
         # Linux: the Blackwell (sm_121) conv engines only exist in cuDNN 9 and the
