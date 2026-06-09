@@ -4,6 +4,7 @@
 #include "common/platform.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -109,7 +110,7 @@ private:
 
     bool                 ok_ = true;
     bool                 sealed_ = false;
-    int                  fd_ = -1;
+    std::FILE*           f_ = nullptr;
     std::string          path_;
     std::string          last_error_;
     uint64_t             cursor_ = 0;
