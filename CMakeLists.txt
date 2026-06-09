@@ -93,6 +93,7 @@ target_include_directories(nlohmann_json INTERFACE
 # ---------------------------------------------------------------------------
 
 add_library(f2k_common STATIC
+    src/common/platform.cpp
     src/common/safetensors.cpp
     src/common/f2k_format.cpp
     src/common/f2k_model_loader.cpp

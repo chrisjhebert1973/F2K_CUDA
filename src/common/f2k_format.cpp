@@ -201,14 +201,8 @@ F2KReader::F2KReader()  = default;
 F2KReader::~F2KReader() { close(); }
 
 void F2KReader::close() {
-    if (mapped_) {
-        ::munmap(mapped_, file_size_);
-        mapped_ = nullptr;
-    }
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
-    }
+    f2k::platform::unmap(map_);
+    mapped_ = nullptr;
     file_size_ = 0;
     order_.clear();
     tensors_.clear();
@@ -217,25 +211,13 @@ void F2KReader::close() {
 
 bool F2KReader::open(const std::string& path) {
     close();
-    fd_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) {
-        last_error_ = "open(): " + std::string(std::strerror(errno));
+    if (!f2k::platform::map_readonly(path, map_, last_error_)) {
         return false;
     }
-    struct stat st;
-    if (::fstat(fd_, &st) != 0) {
-        last_error_ = "fstat()";
-        return false;
-    }
-    file_size_ = static_cast<size_t>(st.st_size);
+    mapped_ = map_.data;
+    file_size_ = map_.size;
     if (file_size_ < sizeof(FileHeader)) {
         last_error_ = "file shorter than header";
-        return false;
-    }
-    mapped_ = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (mapped_ == MAP_FAILED) {
-        last_error_ = "mmap(): " + std::string(std::strerror(errno));
-        mapped_ = nullptr;
         return false;
     }
     const uint8_t* base = static_cast<const uint8_t*>(mapped_);
