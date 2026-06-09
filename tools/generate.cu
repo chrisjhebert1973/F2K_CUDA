@@ -119,7 +119,8 @@ int main(int argc, char** argv) {
         else if (a.size() && a[0] != '-')         out_path    = a;
     }
 
-    const char* home = std::getenv("HOME");
+    const std::string home_str = f2k::platform::home_dir();   // $HOME | %USERPROFILE%
+    const char* home = home_str.c_str();
     // FP8 loads the pre-quantized MXFP8 transformer (fast disk-copy at ctor);
     // NVFP4 loads the pre-quantized NVFP4 transformer.
     const bool use_fp8 = (precision == f2k::cuda::Precision::MXFP8);

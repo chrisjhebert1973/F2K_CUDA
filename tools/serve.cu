@@ -64,7 +64,8 @@ static double since(Clock::time_point t){ return std::chrono::duration<double>(C
 namespace {
 constexpr int PATCH=2, SEQ_TXT=512, IN_CH=128, T5_DIM=12288, TIME_DIM=256;
 constexpr int N_HEADS=32, HEAD_DIM=128, FFN_DIM=12288, N_DOUBLE=8, N_SINGLE=24;
-const char* HOME = std::getenv("HOME");
+const std::string HOME_DIR = f2k::platform::home_dir();   // $HOME | %USERPROFILE%
+const char* HOME = HOME_DIR.c_str();
 
 bool write_png(const std::string& path, const float* rgb_chw, int H, int W){
     std::vector<uint8_t> b((size_t)H*W*3);
