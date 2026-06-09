@@ -37,11 +37,32 @@
 #define STBIR_NO_SIMD          // arm_neon.h intrinsics don't compile under nvcc
 #include "stb_image_resize2.h"
 
-#include <arpa/inet.h>
-#include <csignal>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+// --- cross-platform TCP sockets (POSIX BSD sockets | Windows Winsock2) ------
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+  using sock_t = SOCKET;
+  static inline void net_startup(){ WSADATA w; WSAStartup(MAKEWORD(2,2), &w); }
+  static inline void sock_close(sock_t s){ closesocket(s); }
+  static inline bool sock_valid(sock_t s){ return s != INVALID_SOCKET; }
+  static inline int  sock_recv(sock_t s, void* b, int n){ return recv(s,(char*)b,n,0); }
+  static inline int  sock_send(sock_t s, const void* b, size_t n){ return send(s,(const char*)b,(int)n,0); }
+  static inline void ignore_sigpipe(){}                 // Windows raises no SIGPIPE
+#else
+  #include <arpa/inet.h>
+  #include <csignal>
+  #include <netinet/in.h>
+  #include <sys/socket.h>
+  #include <unistd.h>
+  using sock_t = int;
+  static inline void net_startup(){}
+  static inline void sock_close(sock_t s){ ::close(s); }
+  static inline bool sock_valid(sock_t s){ return s >= 0; }
+  static inline int  sock_recv(sock_t s, void* b, int n){ return (int)::read(s,b,(size_t)n); }
+  static inline int  sock_send(sock_t s, const void* b, size_t n){ return (int)::write(s,b,n); }
+  static inline void ignore_sigpipe(){ std::signal(SIGPIPE, SIG_IGN); }
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -437,14 +458,15 @@ struct Worker {
 };
 
 // read one '\n'-terminated line from fd
-bool read_line(int fd, std::string& line){
+bool read_line(sock_t fd, std::string& line){
     line.clear(); char c;
-    while(true){ ssize_t n=read(fd,&c,1); if(n<=0) return !line.empty(); if(c=='\n') return true; line+=c; }
+    while(true){ int n=sock_recv(fd,&c,1); if(n<=0) return !line.empty(); if(c=='\n') return true; line+=c; }
 }
 } // namespace
 
 int main(int argc,char**argv){
-    std::signal(SIGPIPE, SIG_IGN);   // a client disconnecting mid-stream must not kill us
+    net_startup();                   // WSAStartup on Windows; no-op on POSIX
+    ignore_sigpipe();                // a client disconnecting mid-stream must not kill us (POSIX)
     int port=8765;
     for(int i=1;i<argc;++i){ std::string a=argv[i];
         if(a=="--port"&&i+1<argc) port=std::atoi(argv[++i]); }
@@ -452,23 +474,23 @@ int main(int argc,char**argv){
     std::fprintf(stderr,"[worker] loading resident models...\n");
     if(!w.init(err)){ std::fprintf(stderr,"[worker] init failed: %s\n",err.c_str()); return 1; }
 
-    int srv=socket(AF_INET,SOCK_STREAM,0); int yes=1;
-    setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+    sock_t srv=socket(AF_INET,SOCK_STREAM,0); int yes=1;
+    setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const char*>(&yes),sizeof(yes));
     sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(port);
     addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);   // 127.0.0.1 only
     if(bind(srv,(sockaddr*)&addr,sizeof(addr))<0){ perror("bind"); return 1; }
     listen(srv,4);
     std::fprintf(stderr,"[worker] ready, listening on 127.0.0.1:%d\n",port);
     while(true){
-        int fd=accept(srv,nullptr,nullptr); if(fd<0) continue;
+        sock_t fd=accept(srv,nullptr,nullptr); if(!sock_valid(fd)) continue;
         std::string line; json resp;
         // emit writes one '\n'-delimited JSON line (progress events) to the client.
-        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!write(fd,s.data(),s.size()); };
+        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!sock_send(fd,s.data(),s.size()); };
         if(read_line(fd,line)){
             try { resp=w.generate(json::parse(line), emit); }
             catch(const std::exception& e){ resp=json{{"ok",false},{"error",std::string("parse/exec: ")+e.what()}}; }
         } else resp=json{{"ok",false},{"error","empty request"}};
-        std::string out=resp.dump()+"\n"; (void)!write(fd,out.data(),out.size()); close(fd);
+        std::string out=resp.dump()+"\n"; (void)!sock_send(fd,out.data(),out.size()); sock_close(fd);
         if(resp.value("ok",false)) std::fprintf(stderr,"[worker] job ok %.1fs\n",resp.value("elapsed",0.0));
         else std::fprintf(stderr,"[worker] job ERR: %s\n",resp.value("error","").c_str());
     }
