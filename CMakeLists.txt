@@ -28,10 +28,14 @@ if(F2K_ENABLE_CUDA)
     # MUST be set before enable_language(CUDA); otherwise CMake's auto-probe
     # writes some random fallback (Turing 75 in this case) and our default
     # never wins. Arch knob: 121a = Blackwell GB10 / DGX Spark (default),
-    # 120 = RTX 5090 (consumer Blackwell), 89 = Ada / RTX 4080. Override with
-    # -DF2K_CUDA_ARCH=120. CMAKE_CUDA_ARCHITECTURES is FORCEd from it so the
-    # auto-probe can't win.
-    set(F2K_CUDA_ARCH "121a" CACHE STRING "Target CUDA arch: 121a (GB10) / 120 (RTX 5090) / 89 (Ada)")
+    # 120a = RTX 5090 (consumer Blackwell), 89 = Ada / RTX 4080. Override with
+    # -DF2K_CUDA_ARCH=120a. The trailing 'a' (arch-specific) is REQUIRED on
+    # Blackwell — CUTLASS's block-scaled NVFP4/MXFP8 MMA are arch-conditional
+    # instructions that only emit for sm_1NNa; plain sm_1NN compiles but the
+    # kernels abort at runtime ("Arch conditional MMA instruction used without
+    # targeting appropriate compute capability"). CMAKE_CUDA_ARCHITECTURES is
+    # FORCEd from this so the auto-probe can't win.
+    set(F2K_CUDA_ARCH "121a" CACHE STRING "Target CUDA arch: 121a (GB10) / 120a (RTX 5090) / 89 (Ada)")
     set(CMAKE_CUDA_ARCHITECTURES "${F2K_CUDA_ARCH}" CACHE STRING "" FORCE)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 20)
