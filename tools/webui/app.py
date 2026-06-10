@@ -110,6 +110,25 @@ def list_images(runs=None):
                                   prompt=m.get("prompt", ""), seed=im.get("seed", 0)))
     return cards
 
+def gallery_view():
+    """For the gallery: successful images grouped by batch (run) for display,
+    plus a flat newest-first list the lightbox pages through (so prev/next flows
+    across the whole gallery). Each thumbnail carries its index into `flat`."""
+    batches, flat = [], []
+    for m in list_runs():
+        imgs = [im for im in m["images"] if im.get("ok")]
+        if not imgs:
+            continue
+        bimgs = []
+        for im in imgs:
+            bimgs.append(dict(gi=len(flat), file=im["file"], seed=im.get("seed", 0)))
+            flat.append(dict(file=im["file"], prompt=m.get("prompt", ""),
+                             seed=im.get("seed", 0), rid=m["id"]))
+        batches.append(dict(rid=m["id"], prompt=m.get("prompt", ""),
+                            when=m.get("when", ""), count=len(imgs),
+                            kind=m.get("kind", ""), images=bimgs))
+    return batches, flat
+
 # ----------------------------------------------------------------- worker
 def _worker_call(payload, timeout=600):
     """Send one job to the persistent worker; raises OSError if it's not up."""
@@ -443,7 +462,8 @@ def delete(rid, idx):
 @app.route("/gallery")
 @login_required
 def gallery():
-    return render_template_string(GALLERY, cards=list_images())
+    batches, flat = gallery_view()
+    return render_template_string(GALLERY, batches=batches, flat=flat)
 
 @app.route("/img/<path:fn>")
 @login_required
@@ -492,6 +512,17 @@ output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
  z-index:9;flex-direction:column;gap:14px;text-align:center;padding:20px}
 .spin{width:46px;height:46px;border:5px solid #3b6cf0;border-top-color:transparent;border-radius:50%;
  animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
+.batch{margin:0 0 16px}
+.batch .bh{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin:0 2px 6px}
+.batch .bh a{font-size:14px} .batch .bh .muted{flex:0 0 auto;font-size:12px}
+.gthumb{width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;border:1px solid #2c3038;
+ cursor:zoom-in;display:block}
+#lb .nav{position:fixed;top:50%;transform:translateY(-50%);font-size:46px;line-height:1;color:#fff;
+ opacity:.55;padding:8px 14px;cursor:pointer;user-select:none;-webkit-user-select:none}
+#lb .nav:active{opacity:1} #lbprev{left:4px} #lbnext{right:4px}
+#lb .cap{position:fixed;left:0;right:0;bottom:0;padding:10px 14px;background:#000a;font-size:13px;
+ color:#cfd3db;text-align:center} #lb .cap a{color:#8fb6ff}
+#lb .cap .n{color:#8a8f9c;font-variant-numeric:tabular-nums}
 """
 STREAM_JS = """<script>
 async function streamSubmit(form){
@@ -687,9 +718,30 @@ GALLERY = """<!doctype html><meta name=viewport content="width=device-width,init
 <title>F2K · gallery</title><style>{{css}}</style><div class=wrap>
 <header><h1><a href="{{url_for('index')}}">← New</a> Gallery</h1><a href="{{url_for('logout')}}">Sign out</a></header>
 {% with msg=get_flashed_messages() %}{% if msg %}<div class=flash>{{msg[0]}}</div>{% endif %}{% endwith %}
-<div class=grid>{% for c in cards %}<a class=card href="{{url_for('result',rid=c.rid)}}">
-<img src="{{url_for('img',fn=c.file)}}"><div class=c>{{c.prompt[:60]}}</div></a>{% endfor %}</div>
-</div>""".replace("{{css}}", BASE_CSS)
+{% for b in batches %}<div class=batch>
+ <div class=bh><a href="{{url_for('result',rid=b.rid)}}">{{ (b.prompt[:70] if b.prompt else 'untitled') }}</a>
+ <span class=muted>{{b.when}} · {{b.count}} img{{'s' if b.count>1}}{% if b.kind %} · {{b.kind}}{% endif %}</span></div>
+ <div class=grid>{% for e in b.images %}<img class=gthumb loading=lazy src="{{url_for('img',fn=e.file)}}" onclick="lbOpen({{e.gi}})">{% endfor %}</div>
+</div>{% else %}<p class=muted>No images yet — <a href="{{url_for('index')}}">generate some</a>.</p>{% endfor %}
+</div>
+<div id=lb onclick="if(event.target.id==='lb')lbClose()"><span class=x onclick="lbClose()">&times;</span>
+<div class=nav id=lbprev onclick="lbStep(-1)">&#8249;</div><img id=lbimg src=""><div class=nav id=lbnext onclick="lbStep(1)">&#8250;</div>
+<div class=cap id=lbcap></div></div>
+<script>
+const IMGS={{flat|tojson}};let lbi=0;
+function esc(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function lbShow(){var m=IMGS[lbi];document.getElementById('lbimg').src='/img/'+encodeURIComponent(m.file);
+ document.getElementById('lbcap').innerHTML='<span class=n>'+(lbi+1)+' / '+IMGS.length+'</span> · '+
+ (m.prompt?esc(m.prompt.slice(0,90))+' · ':'')+'seed '+m.seed+' · <a href="/result/'+m.rid+'">view batch &rarr;</a>';}
+function lbOpen(i){lbi=i;lbShow();document.getElementById('lb').style.display='flex';}
+function lbClose(){document.getElementById('lb').style.display='none';}
+function lbStep(d){lbi=(lbi+d+IMGS.length)%IMGS.length;lbShow();}
+document.addEventListener('keydown',function(e){if(document.getElementById('lb').style.display!=='flex')return;
+ if(e.key==='ArrowLeft')lbStep(-1);else if(e.key==='ArrowRight')lbStep(1);else if(e.key==='Escape')lbClose();});
+(function(){var x0=0,lb=document.getElementById('lb');
+ lb.addEventListener('touchstart',function(e){x0=e.changedTouches[0].clientX;},{passive:true});
+ lb.addEventListener('touchend',function(e){var dx=e.changedTouches[0].clientX-x0;if(Math.abs(dx)>40)lbStep(dx<0?1:-1);},{passive:true});})();
+</script>""".replace("{{css}}", BASE_CSS)
 
 if __name__ == "__main__":
     port = int(os.environ.get("F2K_WEB_PORT", "5000"))
