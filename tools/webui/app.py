@@ -21,7 +21,7 @@ Run metadata (one JSON per run, in runs/):
 Older single-image runs (no `images` key, png named <id>.png) are normalised on
 read by _normalise().
 """
-import os, re, json, time, hmac, secrets, subprocess, threading, socket, base64
+import os, re, glob, json, time, hmac, secrets, subprocess, threading, socket, base64
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for, abort,
                    render_template_string, send_from_directory, flash, Response)
@@ -39,6 +39,41 @@ RES_CHOICES = ["256", "512", "768", "1024"]
 PREC_CHOICES = ["fp8", "nvfp4"]
 COUNT_CHOICES = [1, 2, 4, 8]
 MAX_COUNT = 8
+MODELS_ROOT = os.path.expanduser("~/models")
+STOCK_MODEL = "flux2-klein-9B"
+DEFAULT_MODEL = os.environ.get("F2K_DEFAULT_MODEL", "flux2-klein-4B")
+_PREC_SUBDIR = {"fp8": "transformer_mxfp8", "nvfp4": "transformer_f2k"}
+
+def list_models():
+    """Checkpoint roots the worker can serve: any ~/models/<name> holding a
+    transformer_* dir with .f2k1 shards (see tools/bfl_to_diffusers.py for how
+    finetunes get there). Stock klein-9B first."""
+    out = []
+    try:
+        for name in sorted(os.listdir(MODELS_ROOT)):
+            if any(glob.glob(os.path.join(MODELS_ROOT, name, sub, "*.f2k1"))
+                   for sub in _PREC_SUBDIR.values()):
+                out.append(name)
+    except OSError:
+        pass
+    if STOCK_MODEL in out:
+        out.remove(STOCK_MODEL); out.insert(0, STOCK_MODEL)
+    return out
+
+def _model_fields(model, precision):
+    """Worker payload fields {model, transformer} for a selected checkpoint.
+    Full model roots (own qwen3_f2k encoder, e.g. klein-4B) → model=<root>;
+    transformer-only dirs (klein-9B finetunes like truev2) → overlay on stock.
+    None if the requested quant doesn't exist for this checkpoint."""
+    if not model or model == STOCK_MODEL:
+        return {"model": "", "transformer": ""}
+    root = os.path.join(MODELS_ROOT, model)
+    tf = os.path.join(root, _PREC_SUBDIR.get(precision, "transformer_mxfp8"))
+    if not glob.glob(os.path.join(tf, "*.f2k1")):
+        return None
+    if os.path.isdir(os.path.join(root, "qwen3_f2k")):
+        return {"model": root, "transformer": ""}
+    return {"model": "", "transformer": tf}
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("F2K_SECRET", secrets.token_hex(16))
@@ -167,10 +202,14 @@ def _worker_stream(payload, timeout=600):
     finally:
         s.close()
 
-def _subprocess_call(out_png, prompt, res, precision, steps, seed):
+def _subprocess_call(out_png, prompt, res, precision, steps, seed, fields=None):
     """Fallback: one-shot generate binary (slow — reloads the model)."""
     args = [GENERATE, "--prompt", prompt, "--res", str(res), "--precision", precision,
             "--steps", str(steps), "--seed", str(seed), "--out", out_png]
+    if fields and fields.get("model"):
+        args += ["--model", fields["model"]]
+    if fields and fields.get("transformer"):
+        args += ["--transformer", fields["transformer"]]
     proc = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=600)
     log = (proc.stdout or "") + (proc.stderr or "")
     timing = [ln.strip() for ln in log.splitlines()
@@ -178,20 +217,26 @@ def _subprocess_call(out_png, prompt, res, precision, steps, seed):
     return dict(ok=(proc.returncode == 0 and os.path.exists(out_png)), timing=timing,
                 error=(log[-1500:] if proc.returncode != 0 else ""))
 
-def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None, kind=None):
+def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None, kind=None,
+              model=""):
     """Generate len(seeds) images for one prompt, serialised on the GPU lock.
     If init_image (abs path) is given, runs img2img at the given strength — only
     the persistent worker supports this; the subprocess fallback is txt2img.
-    `kind` tags the run (e.g. 'upscale 2048px') for the result banner."""
+    `kind` tags the run (e.g. 'upscale 2048px') for the result banner.
+    `model` selects an alternate checkpoint from list_models() ('' = stock)."""
     rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
     images, mode, err = [], "worker", ""
+    fields = _model_fields(model, precision)
+    if fields is None:   # checkpoint exists but not in this quant
+        fields = {"model": "", "transformer": ""}
+        model = STOCK_MODEL
     t0 = time.time()
     with _gpu_lock:
         for i, seed in enumerate(seeds):
             fn = f"{rid}_{i}.png"
             out_png = os.path.join(RUNS, fn)
             payload = dict(prompt=prompt, res=res, precision=precision,
-                           steps=steps, seed=seed, out=out_png)
+                           steps=steps, seed=seed, out=out_png, **fields)
             if init_image:
                 payload["init_image"] = init_image
                 payload["strength"] = strength
@@ -199,7 +244,7 @@ def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=No
                 r = _worker_call(payload)
             except OSError:
                 mode = "subprocess (worker down)"
-                r = _subprocess_call(out_png, prompt, res, precision, steps, seed)
+                r = _subprocess_call(out_png, prompt, res, precision, steps, seed, fields)
             if not r.get("ok") and not err:
                 err = r.get("error", "")
             images.append(dict(seed=seed, file=fn, ok=r.get("ok", False),
@@ -207,7 +252,8 @@ def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=No
     meta = dict(id=rid, prompt=prompt, res=res, precision=precision, steps=steps,
                 count=len(seeds), ok=any(im["ok"] for im in images),
                 elapsed=round(time.time() - t0, 1), error=err, mode=mode,
-                when=time.strftime("%Y-%m-%d %H:%M"), images=images)
+                when=time.strftime("%Y-%m-%d %H:%M"), images=images,
+                model=model or STOCK_MODEL)
     if init_image:
         meta["init_from"] = os.path.basename(init_image)
         meta["strength"] = strength
@@ -233,14 +279,20 @@ def _parse_common(form):
         seeds = [(base + i) & 0xFFFFFFFF for i in range(count)]   # reproducible batch
     else:
         seeds = [secrets.randbits(32) for _ in range(count)]
-    return int(res), precision, steps, seeds
+    model = form.get("model", "")
+    if model and model not in list_models():
+        model = ""
+    return int(res), precision, steps, seeds, model
 
 # ----------------------------------------------------------------- routes
 @app.route("/")
 @login_required
 def index():
+    models = list_models()
+    default_model = DEFAULT_MODEL if DEFAULT_MODEL in models else STOCK_MODEL
     return render_template_string(INDEX, res_choices=RES_CHOICES, prec_choices=PREC_CHOICES,
-                                  count_choices=COUNT_CHOICES, cards=list_images()[:12])
+                                  count_choices=COUNT_CHOICES, model_choices=models,
+                                  default_model=default_model, cards=list_images()[:12])
 
 @app.route("/generate", methods=["POST"])
 @login_required
@@ -248,8 +300,8 @@ def generate():
     prompt = (request.form.get("prompt", "") or "").strip()[:800]
     if not prompt:
         flash("Enter a prompt."); return redirect(url_for("index"))
-    res, precision, steps, seeds = _parse_common(request.form)
-    meta = run_batch(prompt, res, precision, steps, seeds)
+    res, precision, steps, seeds, model = _parse_common(request.form)
+    meta = run_batch(prompt, res, precision, steps, seeds, model=model)
     return redirect(url_for("result", rid=meta["id"]))
 
 @app.route("/generate_stream", methods=["POST"])
@@ -259,10 +311,12 @@ def generate_stream():
     browser, saves the run, then emits {event:complete,rid}. Handles plain txt2img
     and remix-from-an-existing-output (src_rid/src_idx + strength)."""
     prompt = (request.form.get("prompt", "") or "").strip()[:800]
-    res, precision, steps, seeds = _parse_common(request.form)
+    res, precision, steps, seeds, model = _parse_common(request.form)
     # optional remix init from an existing output
     init_image = None; strength = None; kind = None
     src = load_run(request.form.get("src_rid", "")) if request.form.get("src_rid") else None
+    if src and not model:
+        model = src.get("model", "")   # remix/inpaint inherit the source checkpoint
     if src:
         try: si = int(request.form.get("src_idx", "0"))
         except ValueError: si = 0
@@ -283,6 +337,11 @@ def generate_stream():
         try: mask_bytes = base64.b64decode(md.split(",", 1)[1])
         except Exception: mask_bytes = None
 
+    fields = _model_fields(model, precision)
+    if fields is None:   # checkpoint exists but not in this quant
+        fields = {"model": "", "transformer": ""}
+        model = STOCK_MODEL
+
     def gen():
         rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
         images, mode, err = [], "worker", ""
@@ -296,7 +355,8 @@ def generate_stream():
                 fn = f"{rid}_{i}.png"
                 out_png = os.path.join(RUNS, fn)
                 payload = dict(prompt=prompt, res=res, precision=precision,
-                               steps=steps, seed=seed, out=out_png, stream=True)
+                               steps=steps, seed=seed, out=out_png, stream=True,
+                               **fields)
                 if init_image:
                     payload["init_image"] = init_image; payload["strength"] = strength
                 if mask_path:
@@ -311,7 +371,7 @@ def generate_stream():
                             final = j
                 except OSError:
                     mode = "subprocess (worker down)"
-                    final = _subprocess_call(out_png, prompt, res, precision, steps, seed)
+                    final = _subprocess_call(out_png, prompt, res, precision, steps, seed, fields)
                 final = final or {"ok": False, "error": "no response"}
                 if not final.get("ok") and not err: err = final.get("error", "")
                 images.append(dict(seed=seed, file=fn, ok=final.get("ok", False),
@@ -321,7 +381,8 @@ def generate_stream():
         meta = dict(id=rid, prompt=prompt, res=res, precision=precision, steps=steps,
                     count=len(seeds), ok=any(im["ok"] for im in images),
                     elapsed=round(time.time() - t0, 1), error=err, mode=mode,
-                    when=time.strftime("%Y-%m-%d %H:%M"), images=images)
+                    when=time.strftime("%Y-%m-%d %H:%M"), images=images,
+                    model=model or STOCK_MODEL)
         if init_image:
             meta["init_from"] = os.path.basename(init_image); meta["strength"] = strength
         if mask_path: meta["kind"] = "inpaint"
@@ -369,12 +430,14 @@ def remix():
     init_path = os.path.join(RUNS, os.path.basename(src["images"][src_idx]["file"]))
     if not os.path.exists(init_path): abort(404)
     prompt = (request.form.get("prompt", "") or "").strip()[:800] or src.get("prompt", "")
-    res, precision, steps, seeds = _parse_common(request.form)
+    res, precision, steps, seeds, model = _parse_common(request.form)
+    if not model:
+        model = src.get("model", "")   # remix inherits the source checkpoint
     try: strength = float(request.form.get("strength", "0.6"))
     except ValueError: strength = 0.6
     strength = max(0.05, min(1.0, strength))
     meta = run_batch(prompt, res, precision, steps, seeds,
-                     init_image=init_path, strength=round(strength, 2))
+                     init_image=init_path, strength=round(strength, 2), model=model)
     return redirect(url_for("result", rid=meta["id"]))
 
 def _save_upload_square(file_storage, maxdim=1024):
@@ -409,12 +472,12 @@ def upload_remix():
     if not init_path:
         flash("Could not read that image (HEIC isn't supported — use JPEG/PNG).")
         return redirect(url_for("index"))
-    res, precision, steps, seeds = _parse_common(request.form)
+    res, precision, steps, seeds, model = _parse_common(request.form)
     try: strength = float(request.form.get("strength", "0.55"))
     except ValueError: strength = 0.55
     strength = max(0.05, min(1.0, strength))
     meta = run_batch(prompt, res, precision, steps, seeds,
-                     init_image=init_path, strength=round(strength, 2))
+                     init_image=init_path, strength=round(strength, 2), model=model)
     return redirect(url_for("result", rid=meta["id"]))
 
 UPSCALE_MAX = 2048        # true 2K (Linear gridDim.y fix unblocked 65536 tokens)
@@ -436,7 +499,8 @@ def upscale(rid, idx):
     steps = max(int(m.get("steps", 8)), 12)        # a few more steps help at 2K
     seeds = [im.get("seed", secrets.randbits(32))]  # reuse seed for consistency
     meta = run_batch(m.get("prompt", ""), target, m.get("precision", "fp8"), steps, seeds,
-                     init_image=init_path, strength=UPSCALE_STRENGTH, kind=f"upscale {target}px")
+                     init_image=init_path, strength=UPSCALE_STRENGTH, kind=f"upscale {target}px",
+                     model=m.get("model", ""))
     return redirect(url_for("result", rid=meta["id"]))
 
 @app.route("/delete/<rid>/<int:idx>", methods=["POST"])
@@ -574,6 +638,7 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 <div class=row>
  <div><label>Batch</label><select name=count onchange="document.getElementById('ovsub').textContent='resident worker · ~8s × '+this.value">{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
+ {% if model_choices|length > 1 %}<div><label>Model</label><select name=model>{% for mc in model_choices %}<option value="{{mc}}" {{'selected' if mc==default_model}}>{{mc.replace('flux2-klein-9B-','').replace('flux2-klein-','')}}{{' (stock)' if loop.first}}</option>{% endfor %}</select></div>{% endif %}
 </div><button>Generate</button></form>
 
 <h1 style="font-size:15px;margin:24px 0 8px;color:#aab0bd">📷 Remix a photo</h1>
@@ -593,6 +658,7 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 <div class=row>
  <div><label>Batch</label><select name=count>{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
+ {% if model_choices|length > 1 %}<div><label>Model</label><select name=model>{% for mc in model_choices %}<option value="{{mc}}" {{'selected' if mc==default_model}}>{{mc.replace('flux2-klein-9B-','').replace('flux2-klein-','')}}{{' (stock)' if loop.first}}</option>{% endfor %}</select></div>{% endif %}
 </div><button>Remix photo</button></form>
 
 {% if cards %}<h1 style="font-size:15px;margin:22px 0 8px;color:#aab0bd">Recent</h1>
@@ -626,7 +692,7 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 </div>
 <p class=muted>Tap an image to enlarge · tap &amp; hold the large view to save it.</p>
 <div class=meta><b>{{m.prompt}}</b><br>
-<code>res {{m.res}} · {{m.precision}} · {{m.steps}} steps · {{m.count}} image{{'s' if m.count>1}}</code><br>
+<code>res {{m.res}} · {{m.precision}} · {{m.steps}} steps · {{m.count}} image{{'s' if m.count>1}}{% if m.model and m.model != 'flux2-klein-9B' %} · {{m.model.replace('flux2-klein-9B-','')}}{% endif %}</code><br>
 <span class=muted>{{m.when}} · {{m.elapsed}}s total · {{m.mode}}</span>
 </div>
 <div id=lb onclick="this.style.display='none'"><span class=x>&times;</span><img id=lbimg src=""></div>

@@ -9,7 +9,9 @@ Group=chris
 # The worker reads $HOME/models/flux2-klein-9B/... so HOME must be set.
 Environment=HOME=/home/chris
 WorkingDirectory=/home/chris/Documents/Development/Cpp/Projects/F2KTest
-ExecStart=/home/chris/Documents/Development/Cpp/Projects/F2KTest/build/serve --port 8765
+# --model preloads the klein-4B encoder at boot (the web UI's default model);
+# 9B loads on demand on first use and stays resident too.
+ExecStart=/home/chris/Documents/Development/Cpp/Projects/F2KTest/build/serve --port 8765 --model /home/chris/models/flux2-klein-4B
 Restart=always
 RestartSec=3
 

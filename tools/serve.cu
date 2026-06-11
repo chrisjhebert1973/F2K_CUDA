@@ -547,6 +547,14 @@ bool read_line(sock_t fd, std::string& line){
     line.clear(); char c;
     while(true){ int n=sock_recv(fd,&c,1); if(n<=0) return !line.empty(); if(c=='\n') return true; line+=c; }
 }
+
+// send() may write fewer bytes than asked (notably on Winsock); a short write
+// mid-JSON-line leaves the client waiting forever for the '\n'. Loop until done.
+bool send_all(sock_t fd, const void* buf, size_t n){
+    const char* p=static_cast<const char*>(buf);
+    while(n){ int k=sock_send(fd,p,n); if(k<=0) return false; p+=k; n-=(size_t)k; }
+    return true;
+}
 } // namespace
 
 int main(int argc,char**argv){
@@ -584,12 +592,12 @@ int main(int argc,char**argv){
         sock_t fd=accept(srv,nullptr,nullptr); if(!sock_valid(fd)) continue;
         std::string line; json resp;
         // emit writes one '\n'-delimited JSON line (progress events) to the client.
-        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!sock_send(fd,s.data(),s.size()); };
+        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!send_all(fd,s.data(),s.size()); };
         if(read_line(fd,line)){
             try { resp=w.generate(json::parse(line), emit); }
             catch(const std::exception& e){ resp=json{{"ok",false},{"error",std::string("parse/exec: ")+e.what()}}; }
         } else resp=json{{"ok",false},{"error","empty request"}};
-        std::string out=resp.dump()+"\n"; (void)!sock_send(fd,out.data(),out.size()); sock_close(fd);
+        std::string out=resp.dump()+"\n"; (void)!send_all(fd,out.data(),out.size()); sock_close(fd);
         if(resp.value("ok",false)) std::fprintf(stderr,"[worker] job ok %.1fs\n",resp.value("elapsed",0.0));
         else std::fprintf(stderr,"[worker] job ERR: %s\n",resp.value("error","").c_str());
     }

@@ -51,8 +51,13 @@ def main():
             sys.exit(1)
         print(f"[start] launching worker: {serve}  (resident model load ~15s)...")
         log = open(os.path.join(tempfile.gettempdir(), "f2k_serve.log"), "w")
-        subprocess.Popen([serve, "--port", str(PORT)], stdout=log,
-                         stderr=subprocess.STDOUT, cwd=ROOT)
+        args = [serve, "--port", str(PORT)]
+        # Preload the default model's encoder (web UI defaults to klein-4B).
+        default_root = os.path.join(os.path.expanduser("~"), "models",
+                                    os.environ.get("F2K_DEFAULT_MODEL", "flux2-klein-4B"))
+        if os.path.isdir(os.path.join(default_root, "qwen3_f2k")):
+            args += ["--model", default_root]
+        subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
         for _ in range(90):
             if worker_up():
                 break
