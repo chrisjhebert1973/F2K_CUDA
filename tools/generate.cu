@@ -14,6 +14,7 @@
 #include "common/bpe_tokenizer.h"
 #include "common/f2k_format.h"
 #include "common/f2k_model_loader.h"
+#include "common/model_manifest.h"
 #include "common/tensor_router.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -97,6 +98,9 @@ int main(int argc, char** argv) {
     std::string tokens_path;
     std::string embeds_path;
     std::string decode_latent_path;   // isolation: decode a ground-truth latent
+    std::string tf_override;          // --transformer <dir>: load all *.f2k1 from this dir
+    std::string model_root_arg;       // --model <root>: dir with f2k_model.json + components
+    std::string dump_embeds_path;     // --dump_embeds: write encoder output (validation)
     uint32_t seed = 0xCAFEBABEu;
     int n_steps = 4;
     int res = 256;   // output image resolution (square); latent = res/8
@@ -111,6 +115,9 @@ int main(int argc, char** argv) {
         else if (a == "--steps"  && i + 1 < argc) n_steps = std::stoi(argv[++i]);
         else if (a == "--res"    && i + 1 < argc) res = std::stoi(argv[++i]);
         else if (a == "--decode_latent" && i + 1 < argc) decode_latent_path = argv[++i];
+        else if (a == "--transformer" && i + 1 < argc) tf_override = argv[++i];
+        else if (a == "--model" && i + 1 < argc) model_root_arg = argv[++i];
+        else if (a == "--dump_embeds" && i + 1 < argc) dump_embeds_path = argv[++i];
         else if (a == "--precision" && i + 1 < argc) {
             std::string p = argv[++i];
             precision = (p == "fp8" || p == "mxfp8")
@@ -125,19 +132,38 @@ int main(int argc, char** argv) {
     // NVFP4 loads the pre-quantized NVFP4 transformer.
     const bool use_fp8 = (precision == f2k::cuda::Precision::MXFP8);
     const char* tf_dir = use_fp8 ? "transformer_mxfp8" : "transformer_f2k";
-    const fs::path s1 = fs::path(home) / "models/flux2-klein-9B" / tf_dir / "shard-00001.f2k1";
-    const fs::path s2 = fs::path(home) / "models/flux2-klein-9B" / tf_dir / "shard-00002.f2k1";
-    const fs::path vae_path = fs::path(home) / "models/flux2-klein-9B/vae_f2k/vae.f2k1";
-    for (const auto& p : {s1, s2, vae_path}) {
-        if (!fs::exists(p)) { std::fprintf(stderr, "missing: %s\n", p.c_str()); return 1; }
+    const fs::path model_root = model_root_arg.empty()
+        ? fs::path(home) / "models/flux2-klein-9B"
+        : fs::path(model_root_arg);
+    f2k::ModelManifest mf;
+    std::string mf_err;
+    if (!mf.load(model_root, &mf_err)) {
+        std::fprintf(stderr, "manifest: %s\n", mf_err.c_str()); return 1;
+    }
+    const fs::path tf_path = tf_override.empty()
+        ? model_root / tf_dir
+        : fs::path(tf_override);
+    std::vector<fs::path> tf_shards;
+    if (fs::is_directory(tf_path))
+        for (const auto& e : fs::directory_iterator(tf_path))
+            if (e.path().extension() == ".f2k1") tf_shards.push_back(e.path());
+    std::sort(tf_shards.begin(), tf_shards.end());
+    const fs::path vae_path = model_root / "vae_f2k/vae.f2k1";
+    if (tf_shards.empty()) {
+        std::fprintf(stderr, "no .f2k1 shards in: %s\n", tf_path.string().c_str()); return 1;
+    }
+    if (!fs::exists(vae_path)) {
+        std::fprintf(stderr, "missing: %s\n", vae_path.string().c_str()); return 1;
     }
 
     // ============================================================
     // 1. Load transformer + VAE
     // ============================================================
     f2k::F2KModelLoader ld;
-    if (!ld.add_shard(s1.string()) || !ld.add_shard(s2.string())) {
-        std::fprintf(stderr, "loader: %s\n", ld.last_error().c_str()); return 1;
+    for (const auto& s : tf_shards) {
+        if (!ld.add_shard(s.string())) {
+            std::fprintf(stderr, "loader: %s\n", ld.last_error().c_str()); return 1;
+        }
     }
     f2k::TensorRouter router(ld);
     if (!router.build()) { std::fprintf(stderr, "router: %s\n", router.last_error().c_str()); return 1; }
@@ -152,11 +178,18 @@ int main(int argc, char** argv) {
     std::unique_ptr<f2k::cuda::QwenEncoder> qwen;
     bool use_qwen = !tokens_path.empty() || !prompt.empty();
     if (use_qwen) {
+        std::vector<fs::path> q_shards;
+        const fs::path q_dir = model_root / "qwen3_f2k";
+        if (fs::is_directory(q_dir))
+            for (const auto& e : fs::directory_iterator(q_dir))
+                if (e.path().extension() == ".f2k1") q_shards.push_back(e.path());
+        std::sort(q_shards.begin(), q_shards.end());
+        if (q_shards.empty()) {
+            std::fprintf(stderr, "no .f2k1 shards in: %s\n", q_dir.string().c_str()); return 1;
+        }
         qwen_ld = std::make_unique<f2k::F2KModelLoader>();
-        for (int i = 1; i <= 4; ++i) {
-            char p[256];
-            std::snprintf(p, sizeof(p), "%s/models/flux2-klein-9B/qwen3_f2k/shard-%05d.f2k1", home, i);
-            if (!qwen_ld->add_shard(p)) {
+        for (const auto& p : q_shards) {
+            if (!qwen_ld->add_shard(p.string())) {
                 std::fprintf(stderr, "qwen loader: %s\n", qwen_ld->last_error().c_str()); return 1;
             }
         }
@@ -181,20 +214,16 @@ int main(int argc, char** argv) {
     }
     std::printf("Resolution:    %dx%d  (latent %dx%d, seq_img=%d)\n",
                 res, res, H_LAT, W_LAT, SEQ_IMG);
-    constexpr int T5_DIM  = 12288;
-    constexpr int TIME_DIM = 256;
-    constexpr int N_HEADS = 32, HEAD_DIM = 128;
-    constexpr int FFN_DIM = 12288;
-    constexpr int N_DOUBLE = 8, N_SINGLE = 24;
+    const int T5_DIM = mf.t5_dim, TIME_DIM = mf.time_dim;
     const int N_STEPS = n_steps;
 
     f2k::cuda::FluxTransformer::Config tcfg{};
     tcfg.batch = 1; tcfg.seq_img = SEQ_IMG; tcfg.seq_txt = SEQ_TXT;
     tcfg.H_patches = H_PATCH; tcfg.W_patches = W_PATCH;
     tcfg.in_channels = IN_CH; tcfg.t5_dim = T5_DIM; tcfg.time_dim = TIME_DIM;
-    tcfg.n_heads = N_HEADS; tcfg.head_dim = HEAD_DIM; tcfg.ffn_dim = FFN_DIM;
-    tcfg.num_double_blocks = N_DOUBLE; tcfg.num_single_blocks = N_SINGLE;
-    tcfg.rope_theta = 2000.0f; tcfg.router = &router;
+    tcfg.n_heads = mf.n_heads; tcfg.head_dim = mf.head_dim; tcfg.ffn_dim = mf.ffn_dim;
+    tcfg.num_double_blocks = mf.n_double; tcfg.num_single_blocks = mf.n_single;
+    tcfg.rope_theta = mf.rope_theta; tcfg.router = &router;
     tcfg.precision = precision;
     std::printf("Precision:     %s\n", use_fp8 ? "MXFP8" : "NVFP4");
 
@@ -222,16 +251,21 @@ int main(int argc, char** argv) {
         f2k::cuda::QwenEncoder::Config qcfg{};
         qcfg.seq = SEQ_TXT;
         qcfg.loader = qwen_ld.get();
+        qcfg.hidden = mf.q_hidden; qcfg.n_heads = mf.q_heads;
+        qcfg.n_kv_heads = mf.q_kv_heads; qcfg.head_dim = mf.q_head_dim;
+        qcfg.ffn_dim = mf.q_ffn; qcfg.n_layers = mf.q_layers;
+        qcfg.vocab_size = mf.q_vocab; qcfg.rope_theta = mf.q_rope_theta;
         // diffusers Flux2 uses hidden_states[9,18,27]; HF's hidden_states[0]
         // is the embedding, so hidden_states[k] = output of layer k-1.
-        qcfg.capture_layers = { 8, 17, 26 };
+        qcfg.capture_layers = mf.capture_layers;
         auto t_q0 = std::chrono::steady_clock::now();
         qwen = std::make_unique<f2k::cuda::QwenEncoder>(qcfg);
         if (!qwen->ok()) { std::fprintf(stderr, "qwen ctor: %s\n", qwen->last_error()); return 1; }
         auto t_q1 = std::chrono::steady_clock::now();
-        std::printf("Qwen3Encoder     ready in %.2fs (workspace=%.1f MiB; capture={9,18,27})\n",
+        std::printf("Qwen3Encoder     ready in %.2fs (workspace=%.1f MiB; capture={%d,%d,%d})\n",
                     std::chrono::duration<double>(t_q1 - t_q0).count(),
-                    qwen->workspace_size_bytes() / 1048576.0);
+                    qwen->workspace_size_bytes() / 1048576.0,
+                    mf.capture_layers[0] + 1, mf.capture_layers[1] + 1, mf.capture_layers[2] + 1);
     }
 
     // ============================================================
@@ -308,8 +342,7 @@ int main(int argc, char** argv) {
         std::string src;
         if (!prompt.empty()) {
             f2k::BpeTokenizer tok;
-            const std::string tok_dir =
-                std::string(home) + "/models/flux2-klein-9B/tokenizer";
+            const std::string tok_dir = (model_root / "tokenizer").string();
             if (!tok.load(tok_dir)) {
                 std::fprintf(stderr, "tokenizer load (%s): %s\n",
                              tok_dir.c_str(), tok.error().c_str());
@@ -340,6 +373,17 @@ int main(int argc, char** argv) {
         std::printf("Text encode:   %.2f ms  (%s)\n",
                     std::chrono::duration<double, std::milli>(t_te1 - t_te0).count(),
                     src.c_str());
+        if (!dump_embeds_path.empty()) {
+            // Same layout diffusers_prompt_embeds.py writes: i32 seq, i32 dim, bf16 data.
+            std::vector<__nv_bfloat16> h(txt_elems);
+            cudaMemcpy(h.data(), d_txt, txt_elems * 2, cudaMemcpyDeviceToHost);
+            std::ofstream f(dump_embeds_path, std::ios::binary);
+            const int32_t hdr[2] = { SEQ_TXT, T5_DIM };
+            f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            f.write(reinterpret_cast<const char*>(h.data()), txt_elems * 2);
+            std::printf("Text embeds:   dumped to %s (%d x %d)\n",
+                        dump_embeds_path.c_str(), SEQ_TXT, T5_DIM);
+        }
     } else {
         // Fallback: random text buffer (produces noise-like images).
         std::vector<__nv_bfloat16> h_txt(txt_elems);
