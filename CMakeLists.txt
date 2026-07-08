@@ -356,6 +356,12 @@ if(F2K_ENABLE_CUDA)
         target_link_libraries(serve PRIVATE ws2_32)   # Winsock
     endif()
 
+    # LAN bridge for retro clients (e.g. the SGI Octane ViewKit app). Pure host
+    # C++ — no CUDA — it just forwards jobs to the loopback worker and hands back
+    # decoded RGB. See tools/octane/ for the Octane side.
+    add_executable(octane_bridge tools/octane_bridge.cpp)
+    target_link_libraries(octane_bridge PRIVATE stb nlohmann_json)
+
     add_executable(bench_attention tools/bench_attention.cu)
     target_link_libraries(bench_attention PRIVATE f2k_cuda)
 
