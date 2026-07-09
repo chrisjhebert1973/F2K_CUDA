@@ -73,14 +73,25 @@ Using it:
 - **Model** — a dropdown, populated at startup by asking the bridge (`LIST`) what
   checkpoints it has (klein-4B, 9B, character LoRAs, finetunes…). If the bridge is
   down at launch it shows `(default)` and the bridge picks its configured default.
-- **Resolution / Steps / Seed** — blank seed = random; the seed the bridge actually
-  used comes back with the image and shows in the status line.
-- **Generate** — the request goes out and the UI **stays live** while the GPU works
-  (the socket is serviced by the Xt event loop via `XtAppAddInput`, not a blocking
-  read); the button greys out until the picture arrives.
-- **File → Save Image + Params…** — writes `<name>.png` (real PNG, via bundled
-  `stb_image_write`) plus a `<name>.txt` sidecar with prompt, model, res, steps, the
-  exact seed, and size — enough to reproduce the image later.
+- **Resolution / Steps / Seed / Batch** — blank seed = random; a batch of N uses
+  seed, seed+1, … (or random each). The exact seed of every image comes back with it.
+- **Generate** — the UI **stays live** while the GPU works (the socket is serviced by
+  the Xt event loop via `XtAppAddInput`, not a blocking read). The white **progress
+  bar** tracks real phases streamed from the worker — `loading → encoding → denoise
+  step k/N → decoding` — advancing across the whole batch.
+- **Mode: Generate / Remix** — in **Remix** mode the *Load init image…* button and
+  *Strength %* slider light up. Load a PNG/JPEG/BMP (decoded by bundled `stb_image`);
+  it's centre-cropped to square, capped at 1024, previewed in the canvas, and shipped
+  with the next Generate as an img2img base (lower strength = closer to the original).
+- **Batch strip + navigation** — each finished image drops into the thumbnail grid
+  under the controls; click a thumbnail (or **‹‹ Prev / Next ››**) to show it big in
+  the canvas. The shown one is outlined.
+- **Zoom / pan** — the canvas fits the image to the window by default (so a 1024 in a
+  small window is never clipped). **Zoom− / Fit / 1:1 / Zoom+** buttons scale it, and
+  you **drag with the left button to pan** when zoomed in (SGI mice have no wheel).
+- **File → Save Image + Params…** — saves the *currently shown* image: `<name>.png`
+  (real PNG, via bundled `stb_image_write`) plus a `<name>.txt` sidecar with prompt,
+  model, res, steps, that image's exact seed, and size — enough to reproduce it.
 
 ### Build notes (things you may need to nudge on your IRIX)
 
@@ -91,10 +102,10 @@ small and conventional, but if your ViewKit/Motif vintage differs:
 - **`XmStringCreateLocalized`** / **`XmFONTLIST_DEFAULT_TAG`** are Motif 2.x. On
   older Motif use `XmStringCreateSimple` / `XmStringCreateLtoR` and
   `XmSTRING_DEFAULT_CHARSET`.
-- **`stb_image_write.h`** is bundled and included with its implementation into
-  `roadrunner.cxx`. If the MIPSpro C++ front end fights it, move the
-  `#define STB_IMAGE_WRITE_IMPLEMENTATION` + include into a `stbiw.c`, compile that
-  with `cc`, and link it in (drop the `#define` in the `.cxx`).
+- **`stb_image_write.h`** (PNG save) and **`stb_image.h`** (decode a loaded init
+  image) are bundled and included with their implementations into `roadrunner.cxx`.
+  If the MIPSpro C++ front end fights either, move that `#define ..._IMPLEMENTATION`
+  + include into a `.c` file, compile it with `cc`, and link it in.
 - **`XmCreateScrolledText`** returns the `Text` widget; its geometry parent is
   `XtParent(_prompt)` (the ScrolledWindow) — already handled.
 - The menu bar is wired with `XmMainWindowSetAreas` after ViewKit's `addView`; if
@@ -110,17 +121,28 @@ small and conventional, but if your ViewKit/Motif vintage differs:
 Two request types, each a plain ASCII line:
 
 ```
-LIST\n                                  -> newline-separated model names, then EOF
-GEN <res> <steps> <seed> <model>\n      <model> is a name, or "-" for the default
-<prompt>\n                              (second line, GEN only)
+LIST\n                                          -> model names, one per line, then EOF
+GEN <res> <steps> <seed> <count> <model>\n      <model> is a name, or "-" = default
+<prompt>\n                                      (second line, GEN only)
+
+REMIX <res> <steps> <seed> <count> <strengthx100> <imgW> <imgH> <model>\n
+<prompt>\n
+<imgW*imgH*3 raw RGB bytes>                      client pre-crops to square
 ```
 
-`seed < 0` → the bridge randomises. Generation response — binary, every `int32` in
-**network byte order** (the Octane is big-endian MIPS):
+`seed < 0` → the bridge randomises. The `GEN` response is a **stream of tagged
+messages** (a batch → many). Each starts with the 4-byte magic `F2K1` then an
+`int32` type; every `int32` is **network byte order** (the Octane is big-endian MIPS):
 
 ```
-'F' '2' 'K' '1'   magic (4 bytes)
-int32 status      0 = ok, non-zero = error
-  ok:  int32 width, int32 height, int32 seed, width*height*3 bytes RGB (top row first)
-  err: int32 msglen, msglen bytes of ASCII
+PROGRESS (1): u32 imgIndex, imgTotal, permille(0..1000), len, phase[len]
+IMAGE    (2): u32 imgIndex, w, h, seed, then w*h*3 RGB bytes (top row first)
+DONE     (3): u32 count                       (batch complete)
+ERROR    (4): u32 len, message[len]           (aborts the batch)
 ```
+
+A batch is `PROGRESS* (IMAGE PROGRESS*)* DONE` — progress and images interleaved,
+one `IMAGE` per requested count, terminated by `DONE` (or `ERROR`). Progress phases
+are `starting / loading / encoding / denoise / decoding`; the worker emits these
+cheaply (no preview render) only when the bridge asks (`preview:false`), so the web
+UI is unaffected.

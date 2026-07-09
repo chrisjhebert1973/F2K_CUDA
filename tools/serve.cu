@@ -396,6 +396,15 @@ struct Worker {
         float strength=req.value("strength",0.6f);           // 0..1; only used w/ init_image
         std::vector<std::string> timing; std::string err;
         auto t_all=Clock::now();
+        // Progress: when a client asks to stream WITHOUT previews (preview:false,
+        // e.g. the Octane bridge), emit a cheap per-phase event with no VAE work.
+        // The web UI streams with preview defaulting true, so it never sees these.
+        const bool stream=req.value("stream",false);
+        const bool preview=req.value("preview",true);
+        auto prog=[&](const char* phase,int step,int total){
+            if(stream && !preview && emit)
+                emit(json{{"event","progress"},{"phase",phase},{"step",step},{"total",total}});
+        };
         if(precision!="fp8"&&precision!="nvfp4") precision="fp8";
         steps=std::max(1,std::min(30,steps));
         strength=std::max(0.05f,std::min(1.0f,strength));
@@ -404,6 +413,7 @@ struct Worker {
         if(inpaint) strength=std::max(strength,0.6f);   // need enough steps to fill the region
         std::string model_root=req.value("model",g_model_default);
         if(model_root.empty()) model_root=stock_root();
+        prog("loading",0,0);
         Encoder* E=ensure_encoder(model_root,err);
         if(!E) return json{{"ok",false},{"error",err}};
         if(!ensure(res,precision,transformer,model_root,E->mf,err))
@@ -411,6 +421,7 @@ struct Worker {
         Pipeline& P=*pipe;
 
         // text encode (native tokenizer → Qwen3)
+        prog("encoding",0,0);
         auto te=Clock::now();
         std::vector<int32_t> ids=E->tok.encode_for_flux(prompt,SEQ_TXT);
         cudaMemcpy(E->d_ids,ids.data(),SEQ_TXT*sizeof(int32_t),cudaMemcpyHostToDevice);
@@ -470,7 +481,6 @@ struct Worker {
 
         // denoise
         auto dl=Clock::now();
-        const bool stream=req.value("stream",false);
         const int n_run=steps-i_start;
         const int prev_every=std::max(1,n_run/4);
         std::vector<__nv_bfloat16> cur;   // inpaint host scratch
@@ -496,10 +506,13 @@ struct Worker {
                 return json{{"ok",false},{"error","axpy"}};
             if(stream && emit){
                 int k=i-i_start;
-                if((k+1)%prev_every==0 || k==n_run-1){
+                bool want_prev = preview && ((k+1)%prev_every==0 || k==n_run-1);
+                if(want_prev){
                     int ow=0,oh=0; std::string b=preview_b64(P,384,ow,oh);
                     if(!b.empty()) emit(json{{"event","progress"},{"step",k+1},{"total",n_run},
                                             {"w",ow},{"h",oh},{"img_b64",b}});
+                } else if(!preview){   // cheap per-step progress (no VAE preview)
+                    emit(json{{"event","progress"},{"phase","denoise"},{"step",k+1},{"total",n_run}});
                 }
             }
         }
@@ -525,6 +538,7 @@ struct Worker {
             return json{{"ok",false},{"error","unpatchify"}};
 
         // VAE decode
+        prog("decoding",0,0);
         auto vd=Clock::now();
         if(!P.vae->forward(P.d_latent,P.d_pixels,P.d_v_ws,P.vae->workspace_size_bytes()))
             return json{{"ok",false},{"error",std::string("vae: ")+P.vae->last_error()}};

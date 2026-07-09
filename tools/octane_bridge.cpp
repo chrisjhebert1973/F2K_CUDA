@@ -23,28 +23,30 @@
 //
 // ---- wire protocol (bridge <-> remote client) ------------------------------
 // Request  (ASCII, two '\n'-terminated lines):
-//     line 1:  "<res> <steps> <seed>\n"   three integers; seed < 0 => random
+//     line 1:  "GEN <res> <steps> <seed> <count> <model>\n"  ints; seed<0=>random;
+//                                          model token, "-" => bridge default
 //     line 2:  "<prompt>\n"               UTF-8 text, no embedded newline
-// Response (binary; all int32 in NETWORK byte order — the client may be a
-// big-endian MIPS box, so everything goes through htonl/ntohl):
-//     magic   : 4 bytes  'F','2','K','1'
-//     status  : int32    0 = ok, non-zero = error
-//   if ok:
-//     width   : int32
-//     height  : int32
-//     seed    : int32    the seed actually used (echoed so a random one is known)
-//     pixels  : width*height*3 bytes, RGB, row-major, top row first
-//   if error:
-//     msglen  : int32
-//     message : msglen bytes (ASCII)
+//   ("LIST\n" instead returns newline-separated model names, then EOF.)
+//   Remix (img2img): "REMIX <res> <steps> <seed> <count> <strengthx100> <imgW>
+//     <imgH> <model>\n" then "<prompt>\n" then imgW*imgH*3 raw RGB bytes. The
+//     client pre-crops to square; the bridge stages it as a PNG for the worker.
 //
-// A separate "LIST\n" request returns newline-separated model names as plain
-// text (no framing) and the bridge then closes the connection.
+// Response: a stream of tagged messages (a batch => many). Each begins with the
+// 4-byte magic 'F','2','K','1' then an int32 type; all int32 are NETWORK byte
+// order (the client may be a big-endian MIPS box):
+//     PROGRESS (1): u32 imgIndex, u32 imgTotal, u32 permille(0..1000), u32 len, phase[len]
+//     IMAGE    (2): u32 imgIndex, u32 w, u32 h, u32 seed, pixels[w*h*3] RGB top-row-first
+//     DONE     (3): u32 count                          (batch complete)
+//     ERROR    (4): u32 len, message[len] (ASCII)      (aborts the batch)
+// A batch is: PROGRESS* (IMAGE PROGRESS*)* DONE  — i.e. interleaved progress and
+// images, one IMAGE per requested count, terminated by DONE (or ERROR).
 
 #include <nlohmann/json.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"   // write the remix init image for the worker to read
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -59,6 +61,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -105,6 +108,17 @@ bool recv_line(int fd, std::string& line, size_t cap) {
     }
 }
 
+// Read exactly n bytes (for the raw RGB payload that follows a REMIX request).
+bool recv_exact(int fd, void* buf, size_t n) {
+    char* p = static_cast<char*>(buf);
+    while (n) {
+        ssize_t k = ::read(fd, p, n);
+        if (k <= 0) return false;
+        p += k; n -= static_cast<size_t>(k);
+    }
+    return true;
+}
+
 // Connect to the loopback worker. Returns fd or -1.
 int worker_connect() {
     addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
@@ -120,48 +134,75 @@ int worker_connect() {
     return fd;
 }
 
-// -- response framing ---------------------------------------------------------
-bool send_error(int fd, const std::string& msg) {
-    std::fprintf(stderr, "[bridge] -> error: %s\n", msg.c_str());
-    uint32_t status = htonl(1);
-    uint32_t len    = htonl(static_cast<uint32_t>(msg.size()));
-    return send_all(fd, MAGIC, 4) && send_all(fd, &status, 4) &&
-           send_all(fd, &len, 4) && send_all(fd, msg.data(), msg.size());
+// -- tagged message framing (bridge -> client) --------------------------------
+// A batch streams many messages: PROGRESS* (IMAGE PROGRESS*)* DONE, or ERROR.
+enum { MSG_PROGRESS = 1, MSG_IMAGE = 2, MSG_DONE = 3, MSG_ERROR = 4 };
+
+bool send_u32(int fd, uint32_t v) { uint32_t n = htonl(v); return send_all(fd, &n, 4); }
+
+bool msg_progress(int fd, uint32_t idx, uint32_t total, uint32_t permille,
+                  const std::string& phase) {
+    return send_all(fd, MAGIC, 4) && send_u32(fd, MSG_PROGRESS) &&
+           send_u32(fd, idx) && send_u32(fd, total) && send_u32(fd, permille) &&
+           send_u32(fd, (uint32_t)phase.size()) && send_all(fd, phase.data(), phase.size());
+}
+bool msg_image(int fd, uint32_t idx, int w, int h, uint32_t seed, const uint8_t* rgb) {
+    return send_all(fd, MAGIC, 4) && send_u32(fd, MSG_IMAGE) && send_u32(fd, idx) &&
+           send_u32(fd, (uint32_t)w) && send_u32(fd, (uint32_t)h) && send_u32(fd, seed) &&
+           send_all(fd, rgb, (size_t)w * h * 3);
+}
+bool msg_done(int fd, uint32_t count) {
+    return send_all(fd, MAGIC, 4) && send_u32(fd, MSG_DONE) && send_u32(fd, count);
+}
+bool msg_error(int fd, const std::string& s) {
+    std::fprintf(stderr, "[bridge] -> error: %s\n", s.c_str());
+    return send_all(fd, MAGIC, 4) && send_u32(fd, MSG_ERROR) &&
+           send_u32(fd, (uint32_t)s.size()) && send_all(fd, s.data(), s.size());
 }
 
-bool send_image(int fd, int w, int h, uint32_t seed, const uint8_t* rgb) {
-    uint32_t status = htonl(0);
-    uint32_t nw = htonl(static_cast<uint32_t>(w));
-    uint32_t nh = htonl(static_cast<uint32_t>(h));
-    uint32_t ns = htonl(seed);                        // echo the seed actually used
-    return send_all(fd, MAGIC, 4) && send_all(fd, &status, 4) &&
-           send_all(fd, &nw, 4) && send_all(fd, &nh, 4) && send_all(fd, &ns, 4) &&
-           send_all(fd, rgb, static_cast<size_t>(w) * h * 3);
-}
-
-// -- worker round-trip --------------------------------------------------------
-// Send one JSON job to the resident worker, read its one-line JSON reply.
-bool worker_generate(const json& job, json& reply, std::string& err) {
+// -- worker round-trip (streaming) --------------------------------------------
+// Send one job (stream:true, preview:false) and read the worker's newline-
+// delimited JSON: progress events go to on_prog, the final object to reply.
+bool worker_stream(const json& job, const std::function<void(const json&)>& on_prog,
+                   json& reply, std::string& err) {
     int wf = worker_connect();
     if (wf < 0) { err = "worker not reachable on " + g_worker_host + ":" +
                         std::to_string(g_worker_port); return false; }
     const std::string line = job.dump() + "\n";
-    bool ok = send_all(wf, line.data(), line.size());
-    std::string resp;
-    if (ok) {
-        // the worker may take many seconds; read until the terminating newline.
-        char buf[65536];
-        while (resp.find('\n') == std::string::npos) {
-            ssize_t n = ::read(wf, buf, sizeof buf);
-            if (n <= 0) break;
-            resp.append(buf, static_cast<size_t>(n));
+    if (!send_all(wf, line.data(), line.size())) { ::close(wf); err = "worker send failed"; return false; }
+
+    std::string buf; char chunk[65536]; bool got_final = false;
+    for (;;) {
+        size_t nl;
+        while ((nl = buf.find('\n')) != std::string::npos) {
+            std::string l = buf.substr(0, nl); buf.erase(0, nl + 1);
+            if (l.empty()) continue;
+            json j;
+            try { j = json::parse(l); } catch (const std::exception&) { continue; }
+            if (j.value("event", std::string()) == "progress") { on_prog(j); }
+            else { reply = j; got_final = true; break; }
         }
+        if (got_final) break;
+        ssize_t n = ::read(wf, chunk, sizeof chunk);
+        if (n <= 0) break;
+        buf.append(chunk, (size_t)n);
     }
     ::close(wf);
-    if (!ok || resp.empty()) { err = "worker sent no response"; return false; }
-    try { reply = json::parse(resp); }
-    catch (const std::exception& e) { err = std::string("bad worker JSON: ") + e.what(); return false; }
+    if (!got_final) { err = "worker sent no final result"; return false; }
     return true;
+}
+
+// Map a worker progress event to a within-image fraction [0,1].
+float within_fraction(const json& ev) {
+    const std::string ph = ev.value("phase", std::string());
+    if (ph == "denoise") {
+        int s = ev.value("step", 0), t = ev.value("total", 1); if (t < 1) t = 1;
+        return 0.10f + 0.80f * ((float)s / (float)t);
+    }
+    if (ph == "loading")  return 0.03f;
+    if (ph == "encoding") return 0.08f;
+    if (ph == "decoding") return 0.95f;
+    return 0.0f;
 }
 
 // -- model discovery / resolution (mirrors the Flask UI's list_models +
@@ -224,7 +265,7 @@ void resolve_model(std::string name, json& job) {
 // -- one client ---------------------------------------------------------------
 void handle_client(int fd) {
     std::string head;
-    if (!recv_line(fd, head, 256)) { send_error(fd, "empty request"); return; }
+    if (!recv_line(fd, head, 256)) { msg_error(fd, "empty request"); return; }
 
     // LIST: reply with newline-separated model names, then close (read to EOF).
     if (head == "LIST") {
@@ -235,15 +276,42 @@ void handle_client(int fd) {
         return;
     }
 
+    // GEN <res> <steps> <seed> <count> <model>
+    // REMIX <res> <steps> <seed> <count> <strengthx100> <imgW> <imgH> <model>
+    //   ...followed (REMIX only) by imgW*imgH*3 raw RGB bytes after the prompt line.
+    const bool remix = (std::strncmp(head.c_str(), "REMIX ", 6) == 0);
+
     std::string prompt;
-    if (!recv_line(fd, prompt, MAX_PROMPT)) {
-        send_error(fd, "malformed request (want: 'GEN <res> <steps> <seed> [model]' then prompt)");
-        return;
-    }
-    int res = 512, steps = 4; long seed_in = -1; char modelbuf[128] = "";
+    if (!recv_line(fd, prompt, MAX_PROMPT)) { msg_error(fd, "malformed request"); return; }
+
+    int res = 512, steps = 4, count = 1, strength100 = 60, imgW = 0, imgH = 0;
+    long seed_in = -1; char modelbuf[128] = "";
     const char* p = head.c_str();
-    if (std::strncmp(p, "GEN ", 4) == 0) p += 4;          // optional keyword
-    std::sscanf(p, "%d %d %ld %127s", &res, &steps, &seed_in, modelbuf);
+    if (remix) {
+        p += 6;
+        std::sscanf(p, "%d %d %ld %d %d %d %d %127s", &res, &steps, &seed_in, &count,
+                    &strength100, &imgW, &imgH, modelbuf);
+    } else {
+        if (std::strncmp(p, "GEN ", 4) == 0) p += 4;      // optional keyword
+        std::sscanf(p, "%d %d %ld %d %127s", &res, &steps, &seed_in, &count, modelbuf);
+    }
+
+    // Remix: pull the raw RGB payload and stage it as a PNG the worker can read.
+    std::string init_png;
+    if (remix) {
+        if (imgW <= 0 || imgH <= 0 || imgW > 2048 || imgH > 2048) {
+            msg_error(fd, "bad init image dimensions"); return;
+        }
+        std::vector<uint8_t> rgb((size_t)imgW * imgH * 3);
+        if (!recv_exact(fd, rgb.data(), rgb.size())) { msg_error(fd, "short init image"); return; }
+        char ip[256];
+        std::snprintf(ip, sizeof ip, "/tmp/octane_init_%d_%u.png",
+                      getpid(), static_cast<unsigned>(g_rng()));
+        if (!stbi_write_png(ip, imgW, imgH, 3, rgb.data(), imgW * 3)) {
+            msg_error(fd, "stage init png failed"); return;
+        }
+        init_png = ip;
+    }
 
     // clamp to worker-legal values so a typo can't cost a worker error round-trip
     bool res_ok = false;
@@ -251,38 +319,63 @@ void handle_client(int fd) {
     if (!res_ok) res = 512;
     if (steps < 1)  steps = 1;
     if (steps > 30) steps = 30;
-    uint32_t seed = (seed_in < 0) ? g_rng() : static_cast<uint32_t>(seed_in);
-    if (prompt.empty()) { send_error(fd, "empty prompt"); return; }
+    if (count < 1)  count = 1;
+    if (count > 8)  count = 8;
+    if (strength100 < 5)   strength100 = 5;
+    if (strength100 > 100) strength100 = 100;
+    if (prompt.empty()) { msg_error(fd, "empty prompt"); if (!init_png.empty()) ::remove(init_png.c_str()); return; }
 
-    // stage the PNG where the worker (same host) can write it, then reclaim it.
-    char out[256];
-    std::snprintf(out, sizeof out, "/tmp/octane_bridge_%d_%u.png",
-                  getpid(), static_cast<unsigned>(g_rng()));
+    std::fprintf(stderr, "[bridge] %s res=%d steps=%d seed=%ld count=%d%s model=%s prompt=\"%.50s\"\n",
+                 remix ? "remix" : "batch", res, steps, seed_in, count,
+                 remix ? (" str=" + std::to_string(strength100)).c_str() : "",
+                 modelbuf[0] ? modelbuf : "(default)", prompt.c_str());
 
-    json job = {{"prompt", prompt}, {"res", res}, {"precision", g_precision},
-                {"steps", steps}, {"seed", static_cast<int64_t>(seed)}, {"out", out}};
-    resolve_model(modelbuf, job);
+    for (int idx = 0; idx < count; ++idx) {
+        // reproducible batch (base+i) if a seed was given, else random per image.
+        uint32_t seed = (seed_in < 0) ? g_rng() : static_cast<uint32_t>(seed_in + idx);
+        msg_progress(fd, (uint32_t)idx, (uint32_t)count,
+                     (uint32_t)(1000.0f * idx / count), "starting");
 
-    std::fprintf(stderr, "[bridge] job res=%d steps=%d seed=%u model=%s prompt=\"%.60s\"\n",
-                 res, steps, seed, modelbuf[0] ? modelbuf : "(default)", prompt.c_str());
+        char out[256];
+        std::snprintf(out, sizeof out, "/tmp/octane_bridge_%d_%u.png",
+                      getpid(), static_cast<unsigned>(g_rng()));
+        json job = {{"prompt", prompt}, {"res", res}, {"precision", g_precision},
+                    {"steps", steps}, {"seed", static_cast<int64_t>(seed)}, {"out", out},
+                    {"stream", true}, {"preview", false}};   // cheap per-step progress
+        resolve_model(modelbuf, job);
+        if (!init_png.empty()) {
+            job["init_image"] = init_png;
+            job["strength"]   = strength100 / 100.0;
+        }
 
-    json reply; std::string err;
-    if (!worker_generate(job, reply, err)) { send_error(fd, err); return; }
-    if (!reply.value("ok", false)) {
-        send_error(fd, "worker: " + reply.value("error", std::string("unknown")));
+        auto on_prog = [&](const json& ev) {
+            float overall = ((float)idx + within_fraction(ev)) / (float)count;
+            msg_progress(fd, (uint32_t)idx, (uint32_t)count,
+                         (uint32_t)(overall * 1000.0f),
+                         ev.value("phase", std::string("denoise")));
+        };
+        json reply; std::string err;
+        if (!worker_stream(job, on_prog, reply, err)) {
+            msg_error(fd, err); ::remove(out); if (!init_png.empty()) ::remove(init_png.c_str()); return;
+        }
+        if (!reply.value("ok", false)) {
+            msg_error(fd, "worker: " + reply.value("error", std::string("unknown")));
+            ::remove(out); if (!init_png.empty()) ::remove(init_png.c_str()); return;
+        }
+        int w = 0, h = 0, comp = 0;
+        uint8_t* px = stbi_load(out, &w, &h, &comp, 3);   // force RGB
         ::remove(out);
-        return;
+        if (!px) {
+            msg_error(fd, std::string("decode png: ") + stbi_failure_reason());
+            if (!init_png.empty()) ::remove(init_png.c_str()); return;
+        }
+        std::fprintf(stderr, "[bridge] -> image %d/%d %dx%d seed=%u (%.1fs)\n",
+                     idx + 1, count, w, h, seed, reply.value("elapsed", 0.0));
+        msg_image(fd, (uint32_t)idx, w, h, seed, px);
+        stbi_image_free(px);
     }
-
-    int w = 0, h = 0, comp = 0;
-    uint8_t* px = stbi_load(out, &w, &h, &comp, 3);   // force RGB
-    ::remove(out);
-    if (!px) { send_error(fd, std::string("decode png: ") + stbi_failure_reason()); return; }
-
-    std::fprintf(stderr, "[bridge] -> image %dx%d seed=%u (%.1fs worker)\n",
-                 w, h, seed, reply.value("elapsed", 0.0));
-    send_image(fd, w, h, seed, px);
-    stbi_image_free(px);
+    if (!init_png.empty()) ::remove(init_png.c_str());
+    msg_done(fd, (uint32_t)count);
 }
 
 } // namespace
