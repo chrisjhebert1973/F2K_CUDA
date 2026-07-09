@@ -23,13 +23,17 @@
 //
 // ---- wire protocol (bridge <-> remote client) ------------------------------
 // Request  (ASCII, two '\n'-terminated lines):
-//     line 1:  "GEN <res> <steps> <seed> <count> <model>\n"  ints; seed<0=>random;
-//                                          model token, "-" => bridge default
+//     line 1:  "GEN <res> <steps> <seed> <count> <cfgx100> <seedVar> <varx100>
+//                <model>\n"               ints; seed<0=>random; cfgx100=100 => no
+//                                          CFG; varx100=0 => no variation; model
+//                                          token "-" => bridge default
 //     line 2:  "<prompt>\n"               UTF-8 text, no embedded newline
+//     line 3:  "<negative>\n"             CFG unconditional prompt (may be empty)
 //   ("LIST\n" instead returns newline-separated model names, then EOF.)
 //   Remix (img2img): "REMIX <res> <steps> <seed> <count> <strengthx100> <imgW>
-//     <imgH> <model>\n" then "<prompt>\n" then imgW*imgH*3 raw RGB bytes. The
-//     client pre-crops to square; the bridge stages it as a PNG for the worker.
+//     <imgH> <cfgx100> <seedVar> <varx100> <model>\n" then "<prompt>\n" then
+//     "<negative>\n" then imgW*imgH*3 raw RGB bytes. The client pre-crops to
+//     square; the bridge stages it as a PNG for the worker.
 //
 // Response: a stream of tagged messages (a batch => many). Each begins with the
 // 4-byte magic 'F','2','K','1' then an int32 type; all int32 are NETWORK byte
@@ -281,20 +285,25 @@ void handle_client(int fd) {
     //   ...followed (REMIX only) by imgW*imgH*3 raw RGB bytes after the prompt line.
     const bool remix = (std::strncmp(head.c_str(), "REMIX ", 6) == 0);
 
-    std::string prompt;
-    if (!recv_line(fd, prompt, MAX_PROMPT)) { msg_error(fd, "malformed request"); return; }
+    // Two text lines follow the header: prompt, then negative (may be empty).
+    std::string prompt, negative;
+    if (!recv_line(fd, prompt, MAX_PROMPT))   { msg_error(fd, "malformed request"); return; }
+    if (!recv_line(fd, negative, MAX_PROMPT)) { msg_error(fd, "malformed request (negative)"); return; }
 
     int res = 512, steps = 4, count = 1, strength100 = 60, imgW = 0, imgH = 0;
-    long seed_in = -1; char modelbuf[128] = "";
+    int cfg100 = 100, var100 = 0; long seed_in = -1, seed_var = 0; char modelbuf[128] = "";
     const char* p = head.c_str();
     if (remix) {
         p += 6;
-        std::sscanf(p, "%d %d %ld %d %d %d %d %127s", &res, &steps, &seed_in, &count,
-                    &strength100, &imgW, &imgH, modelbuf);
+        std::sscanf(p, "%d %d %ld %d %d %d %d %d %ld %d %127s", &res, &steps, &seed_in, &count,
+                    &strength100, &imgW, &imgH, &cfg100, &seed_var, &var100, modelbuf);
     } else {
         if (std::strncmp(p, "GEN ", 4) == 0) p += 4;      // optional keyword
-        std::sscanf(p, "%d %d %ld %d %127s", &res, &steps, &seed_in, &count, modelbuf);
+        std::sscanf(p, "%d %d %ld %d %d %ld %d %127s", &res, &steps, &seed_in, &count,
+                    &cfg100, &seed_var, &var100, modelbuf);
     }
+    if (cfg100 < 0) cfg100 = 100;
+    if (var100 < 0) var100 = 0; if (var100 > 100) var100 = 100;
 
     // Remix: pull the raw RGB payload and stage it as a PNG the worker can read.
     std::string init_png;
@@ -346,6 +355,11 @@ void handle_client(int fd) {
         if (!init_png.empty()) {
             job["init_image"] = init_png;
             job["strength"]   = strength100 / 100.0;
+        }
+        if (cfg100 != 100) { job["cfg"] = cfg100 / 100.0; job["negative"] = negative; }
+        if (var100 > 0) {
+            job["seed_var"] = static_cast<int64_t>(seed_var);
+            job["var_strength"] = var100 / 100.0;
         }
 
         auto on_prog = [&](const json& ev) {

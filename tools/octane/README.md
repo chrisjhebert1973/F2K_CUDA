@@ -75,6 +75,9 @@ Using it:
   down at launch it shows `(default)` and the bridge picks its configured default.
 - **Resolution / Steps / Seed / Batch** — blank seed = random; a batch of N uses
   seed, seed+1, … (or random each). The exact seed of every image comes back with it.
+- **Negative / Guidance / Variation** — set **Guidance > 1** to turn on classifier-free
+  guidance (uses the **Negative** field; ~2× slower, one extra forward per step).
+  **Variation %** blends the noise toward a second random seed for a nearby variant.
 - **Generate** — the UI **stays live** while the GPU works (the socket is serviced by
   the Xt event loop via `XtAppAddInput`, not a blocking read). The white **progress
   bar** tracks real phases streamed from the worker — `loading → encoding → denoise

@@ -39,6 +39,10 @@ def main():
     ap.add_argument("--list", action="store_true", help="print available models and exit")
     ap.add_argument("--remix", default="", help="init image path (img2img)")
     ap.add_argument("--strength", type=float, default=0.6, help="remix strength 0.05..1.0")
+    ap.add_argument("--negative", default="", help="negative prompt (needs --cfg > 1)")
+    ap.add_argument("--cfg", type=float, default=1.0, help="guidance scale; 1.0 = off")
+    ap.add_argument("--seed-var", type=int, default=0, dest="seed_var")
+    ap.add_argument("--var-strength", type=float, default=0.0, dest="var_strength")
     ap.add_argument("--out", default="/tmp/octane_out", help="output base path (_<idx>.png)")
     a = ap.parse_args()
 
@@ -58,6 +62,8 @@ def main():
     from PIL import Image
     s = socket.create_connection((a.host, a.port), timeout=600)
     s.settimeout(600)
+    cfg100 = max(0, int(round(a.cfg * 100)))
+    var100 = max(0, min(100, int(round(a.var_strength * 100))))
     if a.remix:
         # center-crop to square, cap at 1024, send raw RGB after the header
         im = Image.open(a.remix).convert("RGB")
@@ -68,11 +74,13 @@ def main():
             im = im.resize((1024, 1024)); sq = 1024
         rgb = im.tobytes()
         st = max(5, min(100, int(a.strength * 100)))
-        hdr = f"REMIX {a.res} {a.steps} {a.seed} {a.count} {st} {sq} {sq} {a.model}\n{a.prompt}\n"
+        hdr = (f"REMIX {a.res} {a.steps} {a.seed} {a.count} {st} {sq} {sq} "
+               f"{cfg100} {a.seed_var} {var100} {a.model}\n{a.prompt}\n{a.negative}\n")
         s.sendall(hdr.encode())
         s.sendall(rgb)
     else:
-        req = f"GEN {a.res} {a.steps} {a.seed} {a.count} {a.model}\n{a.prompt}\n".encode()
+        req = (f"GEN {a.res} {a.steps} {a.seed} {a.count} {cfg100} {a.seed_var} {var100} "
+               f"{a.model}\n{a.prompt}\n{a.negative}\n").encode()
         s.sendall(req)
 
     saved = 0

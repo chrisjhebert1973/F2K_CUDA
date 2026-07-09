@@ -95,6 +95,18 @@ static inline __nv_bfloat16 f2b(float v) { return __float2bfloat16(v); }
 static inline float         b2f(__nv_bfloat16 v) { return __bfloat162float(v); }
 static double since(Clock::time_point t){ return std::chrono::duration<double>(Clock::now()-t).count(); }
 
+// Classifier-free guidance combine (per element): out = uncond + cfg*(cond - uncond).
+// out may alias cond (each thread touches only its own index).
+__global__ void cfg_combine_bf16(__nv_bfloat16* out, const __nv_bfloat16* cond,
+                                 const __nv_bfloat16* uncond, float cfg, int n){
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if(i < n){
+        float c = __bfloat162float(cond[i]);
+        float u = __bfloat162float(uncond[i]);
+        out[i] = __float2bfloat16(u + cfg*(c - u));
+    }
+}
+
 namespace {
 constexpr int PATCH=2, SEQ_TXT=512, IN_CH=128, T5_DIM=12288, TIME_DIM=256;
 constexpr int N_HEADS=32, HEAD_DIM=128, FFN_DIM=12288, N_DOUBLE=8, N_SINGLE=24;
@@ -212,11 +224,12 @@ struct Pipeline {
     int H_LAT=0,W_LAT=0,SEQ_IMG=0,H_P=0,W_P=0;
     size_t latent_elems=0, token_elems=0, pixel_elems=0, moment_elems=0;
     void *d_latent=nullptr,*d_tokens=nullptr,*d_velocity=nullptr,*d_pixels=nullptr;
+    void *d_velocity_neg=nullptr;   // CFG: unconditional velocity
     void *d_t_ws=nullptr,*d_v_ws=nullptr;
     void *d_init_pix=nullptr,*d_moments=nullptr,*d_e_ws=nullptr;   // encoder I/O + ws
     std::vector<float> bn_mean, bn_std;   // [IN_CH]
 
-    ~Pipeline(){ for(void* p:{d_latent,d_tokens,d_velocity,d_pixels,d_t_ws,d_v_ws,
+    ~Pipeline(){ for(void* p:{d_latent,d_tokens,d_velocity,d_velocity_neg,d_pixels,d_t_ws,d_v_ws,
                               d_init_pix,d_moments,d_e_ws}) if(p) cudaFree(p); }
 };
 
@@ -227,8 +240,8 @@ struct Encoder {
     std::unique_ptr<f2k::F2KModelLoader> ld;
     std::unique_ptr<f2k::cuda::QwenEncoder> qwen;
     f2k::BpeTokenizer tok;
-    void *d_txt=nullptr,*d_ws=nullptr; int32_t* d_ids=nullptr;
-    ~Encoder(){ for(void* p:{d_txt,d_ws,(void*)d_ids}) if(p) cudaFree(p); }
+    void *d_txt=nullptr,*d_txt_neg=nullptr,*d_ws=nullptr; int32_t* d_ids=nullptr;
+    ~Encoder(){ for(void* p:{d_txt,d_txt_neg,d_ws,(void*)d_ids}) if(p) cudaFree(p); }
 };
 
 // Resident, resolution-independent state.
@@ -240,7 +253,12 @@ struct Worker {
     static std::string stock_root(){ return (fs::path(HOME)/"models/flux2-klein-9B").string(); }
 
     Encoder* ensure_encoder(const std::string& root, std::string& err){
-        auto it=encoders.find(root);
+        // Character checkpoints symlink qwen3_f2k from their base model's root;
+        // key the cache on the canonical path so they share one resident encoder.
+        std::error_code ec;
+        const fs::path canon=fs::weakly_canonical(fs::path(root)/"qwen3_f2k",ec);
+        const std::string key=ec?root:canon.string();
+        auto it=encoders.find(key);
         if(it!=encoders.end()) return it->second.get();
         auto e=std::make_unique<Encoder>();
         if(!e->mf.load(root,&err)) return nullptr;
@@ -264,10 +282,11 @@ struct Worker {
         if(!e->tok.load((fs::path(root)/"tokenizer").string())){
             err="tokenizer: "+e->tok.error(); return nullptr; }
         cudaMalloc(&e->d_txt,(size_t)SEQ_TXT*e->mf.t5_dim*2);
+        cudaMalloc(&e->d_txt_neg,(size_t)SEQ_TXT*e->mf.t5_dim*2);   // CFG unconditional
         cudaMalloc(&e->d_ids,SEQ_TXT*sizeof(int32_t));
         cudaMalloc(&e->d_ws,e->qwen->workspace_size_bytes());
         std::fprintf(stderr,"[worker] encoder %s ready in %.1fs\n",root.c_str(),since(t));
-        return (encoders[root]=std::move(e)).get();
+        return (encoders[key]=std::move(e)).get();
     }
 
     bool init(std::string& err){
@@ -343,6 +362,7 @@ struct Worker {
         p->moment_elems=(size_t)64*p->H_LAT*p->W_LAT;
         cudaMalloc(&p->d_latent,p->latent_elems*2); cudaMalloc(&p->d_tokens,p->token_elems*2);
         cudaMalloc(&p->d_velocity,p->token_elems*2); cudaMalloc(&p->d_pixels,p->pixel_elems*2);
+        cudaMalloc(&p->d_velocity_neg,p->token_elems*2);   // CFG unconditional velocity
         cudaMalloc(&p->d_t_ws,p->model->workspace_size_bytes());
         cudaMalloc(&p->d_v_ws,p->vae->workspace_size_bytes());
         cudaMalloc(&p->d_init_pix,(size_t)3*res*res*2);
@@ -394,8 +414,15 @@ struct Worker {
         std::string mask_image=req.value("mask_image","");    // inpaint mask (abs path)
         std::string transformer=req.value("transformer",g_tf_default);   // shard dir override
         float strength=req.value("strength",0.6f);           // 0..1; only used w/ init_image
+        std::string negative=req.value("negative","");       // CFG unconditional prompt
+        float cfg=req.value("cfg",1.0f);                     // guidance scale; 1.0 = off
+        uint32_t seed_var=(uint32_t)req.value("seed_var",(int64_t)0);
+        float var_strength=req.value("var_strength",0.0f);   // 0..1 blend toward seed_var
         std::vector<std::string> timing; std::string err;
         auto t_all=Clock::now();
+        cfg=std::max(0.0f,std::min(10.0f,cfg));
+        var_strength=std::max(0.0f,std::min(1.0f,var_strength));
+        const bool use_cfg=std::fabs(cfg-1.0f)>1e-3f;
         // Progress: when a client asks to stream WITHOUT previews (preview:false,
         // e.g. the Octane bridge), emit a cheap per-phase event with no VAE work.
         // The web UI streams with preview defaulting true, so it never sees these.
@@ -428,7 +455,15 @@ struct Worker {
         if(!E->qwen->forward(E->d_ids,E->d_txt,E->d_ws,E->qwen->workspace_size_bytes()))
             return json{{"ok",false},{"error",std::string("qwen: ")+E->qwen->last_error()}};
         cudaDeviceSynchronize();
-        timing.push_back("text encode "+std::to_string((int)(since(te)*1000))+"ms");
+        if(use_cfg){
+            // Encode the unconditional (negative) prompt into d_txt_neg for CFG.
+            std::vector<int32_t> nids=E->tok.encode_for_flux(negative,SEQ_TXT);
+            cudaMemcpy(E->d_ids,nids.data(),SEQ_TXT*sizeof(int32_t),cudaMemcpyHostToDevice);
+            if(!E->qwen->forward(E->d_ids,E->d_txt_neg,E->d_ws,E->qwen->workspace_size_bytes()))
+                return json{{"ok",false},{"error",std::string("qwen(neg): ")+E->qwen->last_error()}};
+            cudaDeviceSynchronize();
+        }
+        timing.push_back("text encode "+std::to_string((int)(since(te)*1000))+"ms"+(use_cfg?" +neg":""));
 
         // schedule; for img2img we start partway down it (less noise).
         auto sched=f2k::cuda::FlowMatchScheduler::flux2_dynamic(steps,P.SEQ_IMG);
@@ -442,8 +477,15 @@ struct Worker {
         std::mt19937 rng(seed); std::normal_distribution<float> dn(0,1);
         std::vector<float> x0v, eps_host, mask;   // inpaint state (transformer space)
         if(!img2img){
-            // text-to-image: pure N(0,1) latent → patchify
+            // text-to-image: pure N(0,1) latent → patchify. With var_strength>0,
+            // spherically blend toward a second seed's noise (variance-preserving)
+            // so you get "a nearby variation of this seed".
             std::vector<__nv_bfloat16> hl(P.latent_elems);
+            if(var_strength>0.f){
+                std::mt19937 rng2(seed_var); std::normal_distribution<float> dn2(0,1);
+                const float a=var_strength*1.57079633f, ca=std::cos(a), sa=std::sin(a);
+                for(size_t i=0;i<P.latent_elems;++i) hl[i]=f2b(ca*dn(rng)+sa*dn2(rng2));
+            } else
             for(auto& v:hl) v=f2b(dn(rng));
             cudaMemcpy(P.d_latent,hl.data(),P.latent_elems*2,cudaMemcpyHostToDevice);
             if(!f2k::cuda::patchify_bf16(P.d_latent,P.d_tokens,1,32,P.H_LAT,P.W_LAT,PATCH))
@@ -502,6 +544,14 @@ struct Worker {
             cudaMemcpy(d_temb,ht.data(),TIME_DIM*2,cudaMemcpyHostToDevice);
             if(!P.model->forward(P.d_tokens,E->d_txt,d_temb,P.d_velocity,P.d_t_ws,P.model->workspace_size_bytes()))
                 return json{{"ok",false},{"error",std::string("step: ")+P.model->last_error()}};
+            if(use_cfg){
+                // second (unconditional) forward, then v = v_neg + cfg*(v_cond - v_neg)
+                if(!P.model->forward(P.d_tokens,E->d_txt_neg,d_temb,P.d_velocity_neg,P.d_t_ws,P.model->workspace_size_bytes()))
+                    return json{{"ok",false},{"error",std::string("step(neg): ")+P.model->last_error()}};
+                const int n=(int)P.token_elems, TPB=256, NB=(n+TPB-1)/TPB;
+                cfg_combine_bf16<<<NB,TPB>>>((__nv_bfloat16*)P.d_velocity,
+                    (const __nv_bfloat16*)P.d_velocity,(const __nv_bfloat16*)P.d_velocity_neg,cfg,n);
+            }
             if(!f2k::cuda::axpy_bf16(P.d_tokens,P.d_velocity,sched.dt(i),P.token_elems))
                 return json{{"ok",false},{"error","axpy"}};
             if(stream && emit){

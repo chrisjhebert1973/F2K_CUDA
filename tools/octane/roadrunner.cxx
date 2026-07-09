@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Real PNG output with no system libs (stb rolls its own deflate). Bundled in
 // this directory so the Octane build is self-contained. If MIPSpro's C++ front
@@ -115,6 +116,9 @@ private:
     Widget _thumbDA[MAX_BATCH];     // thumbnail cells (pre-created, shown as used)
     Widget _strength;               // XmScale (remix strength, 5..100)
     Widget _loadBtn;                // "Load init image..." (remix)
+    Widget _negative;               // XmTextField (negative prompt, needs CFG>1)
+    Widget _cfg;                    // XmScale (guidance 1..10; 1 = off)
+    Widget _var;                    // XmScale (variation %, 0..100)
 
     // network target / current selections
     char   _host[256];
@@ -172,6 +176,7 @@ private:
     static void modeCB(Widget, XtPointer, XtPointer);
     static void loadCB(Widget, XtPointer, XtPointer);
     static void loadOkCB(Widget, XtPointer, XtPointer);
+    static void pasteCB(Widget, XtPointer, XtPointer);
     static void exposeCB(Widget, XtPointer, XtPointer);
     static void resizeCB(Widget, XtPointer, XtPointer);
     static void canvasEH(Widget, XtPointer, XEvent*, Boolean*);
@@ -290,11 +295,13 @@ RoadrunnerWindow::RoadrunnerWindow(const char* name, const char* host, int port)
         XmNalignment,      XmALIGNMENT_BEGINNING,
         NULL);
 
-    // multi-line, editable, word-wrapped prompt box
+    // multi-line, editable, word-wrapped prompt box. NB: XmNwordWrap only takes
+    // effect when horizontal scrolling is OFF, hence XmNscrollHorizontal False.
     Arg args[12]; int n = 0;
     XtSetArg(args[n], XmNeditMode, XmMULTI_LINE_EDIT); n++;
     XtSetArg(args[n], XmNwordWrap, True);              n++;
-    XtSetArg(args[n], XmNrows, 3);                     n++;
+    XtSetArg(args[n], XmNscrollHorizontal, False);     n++;
+    XtSetArg(args[n], XmNrows, 6);                     n++;
     XtSetArg(args[n], XmNcolumns, 32);                 n++;
     _prompt = XmCreateScrolledText(panel, (char*)"prompt", args, n);
     XmTextSetString(_prompt, (char*)"a black and white Akita husky dog "
@@ -306,6 +313,14 @@ RoadrunnerWindow::RoadrunnerWindow(const char* name, const char* host, int port)
         XmNleftAttachment,   XmATTACH_FORM,
         XmNrightAttachment,  XmATTACH_FORM,
         NULL);
+
+    // Paste button (X CLIPBOARD, i.e. Ctrl-C'd text). The middle mouse button
+    // still pastes the PRIMARY selection anywhere in the field, the classic X way.
+    Widget pasteBtn = XtVaCreateManagedWidget("Paste", xmPushButtonWidgetClass, panel,
+        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, promptSW,
+        XmNleftAttachment,  XmATTACH_FORM,
+        NULL);
+    XtAddCallback(pasteBtn, XmNactivateCallback, &RoadrunnerWindow::pasteCB, (XtPointer)this);
 
     // ---- model option menu (populated from the bridge's LIST query) --------
     char models[32][64];
@@ -327,7 +342,7 @@ RoadrunnerWindow::RoadrunnerWindow(const char* name, const char* host, int port)
     Widget modelOM = XmCreateOptionMenu(panel, (char*)"modelOM", ma, mn);
     XmStringFree(mlbl);
     XtVaSetValues(modelOM,
-        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, promptSW,
+        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, pasteBtn,
         XmNleftAttachment,  XmATTACH_FORM,
         XmNrightAttachment, XmATTACH_FORM,
         NULL);
@@ -446,9 +461,37 @@ RoadrunnerWindow::RoadrunnerWindow(const char* name, const char* host, int port)
         XmNtitleString, XmStringCreateLocalized((char*)"Strength %"),
         NULL);
 
+    // ---- advanced: negative prompt, guidance (CFG), variation --------------
+    Widget negLbl = XtVaCreateManagedWidget("Negative (needs Guidance > 1):",
+        xmLabelWidgetClass, panel,
+        XmNtopAttachment,  XmATTACH_WIDGET, XmNtopWidget, _strength,
+        XmNleftAttachment, XmATTACH_FORM, XmNalignment, XmALIGNMENT_BEGINNING,
+        NULL);
+    _negative = XtVaCreateManagedWidget("negative", xmTextFieldWidgetClass, panel,
+        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, negLbl,
+        XmNleftAttachment,  XmATTACH_FORM, XmNrightAttachment, XmATTACH_FORM,
+        NULL);
+    Widget advRow = XtVaCreateManagedWidget("adv", xmRowColumnWidgetClass, panel,
+        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, _negative,
+        XmNleftAttachment,  XmATTACH_FORM, XmNrightAttachment, XmATTACH_FORM,
+        XmNorientation,     XmHORIZONTAL, XmNpacking, XmPACK_COLUMN, XmNnumColumns, 1,
+        NULL);
+    // 10..30 with 1 decimal point shown => 1.0..3.0 (10 = off). klein is guidance-
+    // distilled, so it over-cooks past ~2; 1..3 in 0.1 steps is the useful range.
+    _cfg = XtVaCreateManagedWidget("cfg", xmScaleWidgetClass, advRow,
+        XmNorientation, XmHORIZONTAL,
+        XmNminimum, 10, XmNmaximum, 30, XmNvalue, 10, XmNdecimalPoints, 1, XmNshowValue, True,
+        XmNtitleString, XmStringCreateLocalized((char*)"Guidance"),
+        NULL);
+    _var = XtVaCreateManagedWidget("var", xmScaleWidgetClass, advRow,
+        XmNorientation, XmHORIZONTAL,
+        XmNminimum, 0, XmNmaximum, 100, XmNvalue, 0, XmNshowValue, True,
+        XmNtitleString, XmStringCreateLocalized((char*)"Variation %"),
+        NULL);
+
     // ---- generate button ---------------------------------------------------
     _generate = XtVaCreateManagedWidget("Generate", xmPushButtonWidgetClass, panel,
-        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, _strength,
+        XmNtopAttachment,   XmATTACH_WIDGET, XmNtopWidget, advRow,
         XmNleftAttachment,  XmATTACH_FORM,
         XmNrightAttachment, XmATTACH_FORM,
         NULL);
@@ -589,6 +632,9 @@ void RoadrunnerWindow::modelCB(Widget w, XtPointer client, XtPointer) {
 void RoadrunnerWindow::countCB(Widget w, XtPointer client, XtPointer) {
     ((RoadrunnerWindow*)client)->_count = atoi(XtName(w));
 }
+void RoadrunnerWindow::pasteCB(Widget, XtPointer client, XtPointer) {
+    XmTextPaste(((RoadrunnerWindow*)client)->_prompt);   // paste X CLIPBOARD at cursor
+}
 void RoadrunnerWindow::modeCB(Widget w, XtPointer client, XtPointer) {
     ((RoadrunnerWindow*)client)->setMode(strcmp(XtName(w), "Remix") == 0 ? 1 : 0);
 }
@@ -706,18 +752,30 @@ void RoadrunnerWindow::onGenerate() {
     const char* modelTok =
         (_model[0] && strcmp(_model, "(default)") != 0) ? _model : "-";
     const int remix = (_mode == 1 && _hasInit);
-    char header[256];
+    int cfgv = 10; XmScaleGetValue(_cfg, &cfgv);         // 10..30 => 1.0..3.0 (10 = off)
+    int varv = 0; XmScaleGetValue(_var, &varv);          // 0..100 %
+    long seedVar = (varv > 0) ? (long)(rand() & 0x7fffffff) : 0;
+    int cfg100 = cfgv * 10;                              // 10..30 -> 100..300
+    char* negTxt = XmTextFieldGetString(_negative);
+    if (negTxt) for (char* q = negTxt; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+
+    char header[320];
     if (remix) {
         int st = 60; XmScaleGetValue(_strength, &st);
-        sprintf(header, "REMIX %d %d %ld %d %d %d %d %s\n",
-                _res, steps, seed, _count, st, _initDim, _initDim, modelTok);
+        sprintf(header, "REMIX %d %d %ld %d %d %d %d %d %ld %d %s\n",
+                _res, steps, seed, _count, st, _initDim, _initDim,
+                cfg100, seedVar, varv, modelTok);
     } else {
-        sprintf(header, "GEN %d %d %ld %d %s\n", _res, steps, seed, _count, modelTok);
+        sprintf(header, "GEN %d %d %ld %d %d %ld %d %s\n",
+                _res, steps, seed, _count, cfg100, seedVar, varv, modelTok);
     }
     int ok = send_all(fd, header, (int)strlen(header)) &&
              send_all(fd, prompt ? prompt : "", prompt ? (int)strlen(prompt) : 0) &&
+             send_all(fd, "\n", 1) &&
+             send_all(fd, negTxt ? negTxt : "", negTxt ? (int)strlen(negTxt) : 0) &&
              send_all(fd, "\n", 1);
-    if (ok && remix)                             // raw RGB payload follows the prompt line
+    if (negTxt) XtFree(negTxt);
+    if (ok && remix)                             // raw RGB payload follows the two text lines
         ok = send_all(fd, _initRGB, _initDim * _initDim * 3);
 
     // snapshot request params for File > Save (per-image seed arrives with each image)
@@ -1227,6 +1285,7 @@ int main(int argc, char** argv) {
     const char* host = DEFAULT_HOST;
     int         port = DEFAULT_PORT;
     extractArgs(&argc, argv, &host, &port);
+    srand((unsigned)time(NULL));                 // variation seeds
 
     VkApp* app = new VkApp((char*)"Roadrunner", &argc, argv);
     RoadrunnerWindow* win = new RoadrunnerWindow("roadrunner", host, port);
