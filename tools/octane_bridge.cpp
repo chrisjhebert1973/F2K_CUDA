@@ -266,6 +266,75 @@ void resolve_model(std::string name, json& job) {
     else                                      job["transformer"] = tf.string(); // 9B overlay
 }
 
+// -- outpaint compositing (bridge-side, so the retro client stays simple) -----
+// Bilinear resize of interleaved 8-bit RGB(A) — ch channels.
+void resize_bilinear(const uint8_t* src, int sw, int sh,
+                     uint8_t* dst, int dw, int dh, int ch) {
+    for (int y = 0; y < dh; ++y) {
+        float fy = (dh > 1) ? (float)y * (sh - 1) / (dh - 1) : 0.f;
+        int y0 = (int)fy, y1 = std::min(y0 + 1, sh - 1); float wy = fy - y0;
+        for (int x = 0; x < dw; ++x) {
+            float fx = (dw > 1) ? (float)x * (sw - 1) / (dw - 1) : 0.f;
+            int x0 = (int)fx, x1 = std::min(x0 + 1, sw - 1); float wx = fx - x0;
+            for (int c = 0; c < ch; ++c) {
+                float a = src[((size_t)y0 * sw + x0) * ch + c], b = src[((size_t)y0 * sw + x1) * ch + c];
+                float d = src[((size_t)y1 * sw + x0) * ch + c], e = src[((size_t)y1 * sw + x1) * ch + c];
+                float top = a + (b - a) * wx, bot = d + (e - d) * wx;
+                dst[((size_t)y * dw + x) * ch + c] = (uint8_t)(top + (bot - top) * wy + 0.5f);
+            }
+        }
+    }
+}
+
+// Separable box blur of an 8-bit grey image (feathers the outpaint mask seam).
+void box_blur_gray(std::vector<uint8_t>& img, int w, int h, int r) {
+    if (r < 1) return;
+    std::vector<uint8_t> tmp(img.size());
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+        int s = 0, c = 0;
+        for (int k = -r; k <= r; ++k) { int xx = x + k; if (xx >= 0 && xx < w) { s += img[(size_t)y * w + xx]; ++c; } }
+        tmp[(size_t)y * w + x] = (uint8_t)(s / c);
+    }
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+        int s = 0, c = 0;
+        for (int k = -r; k <= r; ++k) { int yy = y + k; if (yy >= 0 && yy < h) { s += tmp[(size_t)yy * w + x]; ++c; } }
+        img[(size_t)y * w + x] = (uint8_t)(s / c);
+    }
+}
+
+// Zoom-out outpaint: a shrunk copy of the source centred in an R×R canvas (the
+// border seeded with a stretched copy), plus a feathered mask (white = fill the
+// new border). Writes both PNGs for the worker's inpaint path.
+bool stage_outpaint(const uint8_t* src, int sw, int sh, int R, float zoom,
+                    std::string& canvas_path, std::string& mask_path) {
+    int inner = (int)(R / zoom); if (inner < 64) inner = 64; if (inner > R) inner = R;
+    int off = (R - inner) / 2;
+    std::vector<uint8_t> canvas((size_t)R * R * 3), innerimg((size_t)inner * inner * 3);
+    // blurred border seed: hard-downscale then upscale (cheap heavy blur), so the
+    // model has soft colour to fill from rather than sharp stretched detail.
+    int b = std::max(4, R / 16);
+    std::vector<uint8_t> tiny((size_t)b * b * 3);
+    resize_bilinear(src, sw, sh, tiny.data(), b, b, 3);
+    resize_bilinear(tiny.data(), b, b, canvas.data(), R, R, 3);
+    resize_bilinear(src, sw, sh, innerimg.data(), inner, inner, 3);   // sharp centre
+    for (int y = 0; y < inner; ++y) for (int x = 0; x < inner; ++x) {
+        const uint8_t* s = &innerimg[((size_t)y * inner + x) * 3];
+        uint8_t* d = &canvas[((size_t)(off + y) * R + (off + x)) * 3];
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+    }
+    std::vector<uint8_t> mask((size_t)R * R, 255);           // 255 = regenerate...
+    for (int y = off; y < off + inner; ++y) for (int x = off; x < off + inner; ++x)
+        mask[(size_t)y * R + x] = 0;                         // ...0 = keep the centre
+    box_blur_gray(mask, R, R, std::max(4, R / 128));         // feather the seam
+    char cp[256], mp[256];
+    std::snprintf(cp, sizeof cp, "/tmp/octane_op_%d_%u.png", getpid(), (unsigned)g_rng());
+    std::snprintf(mp, sizeof mp, "/tmp/octane_om_%d_%u.png", getpid(), (unsigned)g_rng());
+    if (!stbi_write_png(cp, R, R, 3, canvas.data(), R * 3)) return false;
+    if (!stbi_write_png(mp, R, R, 1, mask.data(), R))        return false;
+    canvas_path = cp; mask_path = mp;
+    return true;
+}
+
 // -- one client ---------------------------------------------------------------
 void handle_client(int fd) {
     std::string head;
@@ -280,10 +349,13 @@ void handle_client(int fd) {
         return;
     }
 
-    // GEN <res> <steps> <seed> <count> <model>
-    // REMIX <res> <steps> <seed> <count> <strengthx100> <imgW> <imgH> <model>
-    //   ...followed (REMIX only) by imgW*imgH*3 raw RGB bytes after the prompt line.
-    const bool remix = (std::strncmp(head.c_str(), "REMIX ", 6) == 0);
+    // GEN   <res> <steps> <seed> <count> <cfg> <seedVar> <var> <model>
+    // REMIX / OUTPAINT: same as GEN but with <strengthx100> <imgW> <imgH> before
+    //   <cfg>, and imgW*imgH*3 raw RGB bytes after the two text lines. OUTPAINT
+    //   makes the bridge composite a zoom-out canvas + border mask from that image.
+    const bool remix    = (std::strncmp(head.c_str(), "REMIX ", 6) == 0);
+    const bool outpaint = (std::strncmp(head.c_str(), "OUTPAINT ", 9) == 0);
+    const bool has_img  = remix || outpaint;
 
     // Two text lines follow the header: prompt, then negative (may be empty).
     std::string prompt, negative;
@@ -293,8 +365,8 @@ void handle_client(int fd) {
     int res = 512, steps = 4, count = 1, strength100 = 60, imgW = 0, imgH = 0;
     int cfg100 = 100, var100 = 0; long seed_in = -1, seed_var = 0; char modelbuf[128] = "";
     const char* p = head.c_str();
-    if (remix) {
-        p += 6;
+    if (has_img) {
+        p += remix ? 6 : 9;
         std::sscanf(p, "%d %d %ld %d %d %d %d %d %ld %d %127s", &res, &steps, &seed_in, &count,
                     &strength100, &imgW, &imgH, &cfg100, &seed_var, &var100, modelbuf);
     } else {
@@ -305,22 +377,37 @@ void handle_client(int fd) {
     if (cfg100 < 0) cfg100 = 100;
     if (var100 < 0) var100 = 0; if (var100 > 100) var100 = 100;
 
-    // Remix: pull the raw RGB payload and stage it as a PNG the worker can read.
-    std::string init_png;
-    if (remix) {
+    // Pull the raw RGB payload and stage it for the worker: remix uses it directly
+    // as the init image; outpaint composites a canvas + border mask from it.
+    std::string init_png, mask_png;
+    if (has_img) {
         if (imgW <= 0 || imgH <= 0 || imgW > 2048 || imgH > 2048) {
             msg_error(fd, "bad init image dimensions"); return;
         }
         std::vector<uint8_t> rgb((size_t)imgW * imgH * 3);
         if (!recv_exact(fd, rgb.data(), rgb.size())) { msg_error(fd, "short init image"); return; }
-        char ip[256];
-        std::snprintf(ip, sizeof ip, "/tmp/octane_init_%d_%u.png",
-                      getpid(), static_cast<unsigned>(g_rng()));
-        if (!stbi_write_png(ip, imgW, imgH, 3, rgb.data(), imgW * 3)) {
-            msg_error(fd, "stage init png failed"); return;
+        bool res_ok0 = false; for (int r : RES_OK) if (r == res) res_ok0 = true;
+        int R = res_ok0 ? res : 512;
+        if (outpaint) {
+            if (!stage_outpaint(rgb.data(), imgW, imgH, R, 2.0f, init_png, mask_png)) {
+                msg_error(fd, "stage outpaint failed"); return;
+            }
+            if (strength100 < 80) strength100 = 90;      // outpaint needs to fill freely
+        } else {
+            char ip[256];
+            std::snprintf(ip, sizeof ip, "/tmp/octane_init_%d_%u.png",
+                          getpid(), static_cast<unsigned>(g_rng()));
+            if (!stbi_write_png(ip, imgW, imgH, 3, rgb.data(), imgW * 3)) {
+                msg_error(fd, "stage init png failed"); return;
+            }
+            init_png = ip;
         }
-        init_png = ip;
     }
+    // clean up any staged temp files on the way out
+    auto cleanup = [&]() {
+        if (!init_png.empty()) ::remove(init_png.c_str());
+        if (!mask_png.empty()) ::remove(mask_png.c_str());
+    };
 
     // clamp to worker-legal values so a typo can't cost a worker error round-trip
     bool res_ok = false;
@@ -332,11 +419,12 @@ void handle_client(int fd) {
     if (count > 8)  count = 8;
     if (strength100 < 5)   strength100 = 5;
     if (strength100 > 100) strength100 = 100;
-    if (prompt.empty()) { msg_error(fd, "empty prompt"); if (!init_png.empty()) ::remove(init_png.c_str()); return; }
+    if (prompt.empty()) { msg_error(fd, "empty prompt"); cleanup(); return; }
 
+    const char* kind = outpaint ? "outpaint" : (remix ? "remix" : "batch");
     std::fprintf(stderr, "[bridge] %s res=%d steps=%d seed=%ld count=%d%s model=%s prompt=\"%.50s\"\n",
-                 remix ? "remix" : "batch", res, steps, seed_in, count,
-                 remix ? (" str=" + std::to_string(strength100)).c_str() : "",
+                 kind, res, steps, seed_in, count,
+                 has_img ? (" str=" + std::to_string(strength100)).c_str() : "",
                  modelbuf[0] ? modelbuf : "(default)", prompt.c_str());
 
     for (int idx = 0; idx < count; ++idx) {
@@ -356,6 +444,7 @@ void handle_client(int fd) {
             job["init_image"] = init_png;
             job["strength"]   = strength100 / 100.0;
         }
+        if (!mask_png.empty()) job["mask_image"] = mask_png;   // outpaint (inpaint border)
         if (cfg100 != 100) { job["cfg"] = cfg100 / 100.0; job["negative"] = negative; }
         if (var100 > 0) {
             job["seed_var"] = static_cast<int64_t>(seed_var);
@@ -370,25 +459,25 @@ void handle_client(int fd) {
         };
         json reply; std::string err;
         if (!worker_stream(job, on_prog, reply, err)) {
-            msg_error(fd, err); ::remove(out); if (!init_png.empty()) ::remove(init_png.c_str()); return;
+            msg_error(fd, err); ::remove(out); cleanup(); return;
         }
         if (!reply.value("ok", false)) {
             msg_error(fd, "worker: " + reply.value("error", std::string("unknown")));
-            ::remove(out); if (!init_png.empty()) ::remove(init_png.c_str()); return;
+            ::remove(out); cleanup(); return;
         }
         int w = 0, h = 0, comp = 0;
         uint8_t* px = stbi_load(out, &w, &h, &comp, 3);   // force RGB
         ::remove(out);
         if (!px) {
             msg_error(fd, std::string("decode png: ") + stbi_failure_reason());
-            if (!init_png.empty()) ::remove(init_png.c_str()); return;
+            cleanup(); return;
         }
         std::fprintf(stderr, "[bridge] -> image %d/%d %dx%d seed=%u (%.1fs)\n",
                      idx + 1, count, w, h, seed, reply.value("elapsed", 0.0));
         msg_image(fd, (uint32_t)idx, w, h, seed, px);
         stbi_image_free(px);
     }
-    if (!init_png.empty()) ::remove(init_png.c_str());
+    cleanup();
     msg_done(fd, (uint32_t)count);
 }
 

@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--model", default="-", help="checkpoint name; '-' = bridge default")
     ap.add_argument("--list", action="store_true", help="print available models and exit")
     ap.add_argument("--remix", default="", help="init image path (img2img)")
+    ap.add_argument("--outpaint", action="store_true", help="outpaint the --remix image")
     ap.add_argument("--strength", type=float, default=0.6, help="remix strength 0.05..1.0")
     ap.add_argument("--negative", default="", help="negative prompt (needs --cfg > 1)")
     ap.add_argument("--cfg", type=float, default=1.0, help="guidance scale; 1.0 = off")
@@ -74,7 +75,8 @@ def main():
             im = im.resize((1024, 1024)); sq = 1024
         rgb = im.tobytes()
         st = max(5, min(100, int(a.strength * 100)))
-        hdr = (f"REMIX {a.res} {a.steps} {a.seed} {a.count} {st} {sq} {sq} "
+        cmd = "OUTPAINT" if a.outpaint else "REMIX"
+        hdr = (f"{cmd} {a.res} {a.steps} {a.seed} {a.count} {st} {sq} {sq} "
                f"{cfg100} {a.seed_var} {var100} {a.model}\n{a.prompt}\n{a.negative}\n")
         s.sendall(hdr.encode())
         s.sendall(rgb)

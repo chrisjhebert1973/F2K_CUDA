@@ -177,6 +177,7 @@ private:
     static void loadCB(Widget, XtPointer, XtPointer);
     static void loadOkCB(Widget, XtPointer, XtPointer);
     static void pasteCB(Widget, XtPointer, XtPointer);
+    static void outpaintCB(Widget, XtPointer, XtPointer);
     static void exposeCB(Widget, XtPointer, XtPointer);
     static void resizeCB(Widget, XtPointer, XtPointer);
     static void canvasEH(Widget, XtPointer, XEvent*, Boolean*);
@@ -193,6 +194,8 @@ private:
     static void quitCB(Widget, XtPointer, XtPointer);
 
     void onGenerate();
+    void onOutpaint();
+    void armReceive(int fd);        // go non-blocking + hand socket to the event loop
     void onInput();
     void onSave();
     void doSave(const char* base);
@@ -276,6 +279,9 @@ RoadrunnerWindow::RoadrunnerWindow(const char* name, const char* host, int port)
     Widget saveItem = XtVaCreateManagedWidget("Save Image + Params...",
         xmPushButtonWidgetClass, filePD, NULL);
     XtAddCallback(saveItem, XmNactivateCallback, &RoadrunnerWindow::saveCB, (XtPointer)this);
+    Widget opItem = XtVaCreateManagedWidget("Outpaint shown image",
+        xmPushButtonWidgetClass, filePD, NULL);
+    XtAddCallback(opItem, XmNactivateCallback, &RoadrunnerWindow::outpaintCB, (XtPointer)this);
     XtVaCreateManagedWidget("sep", xmSeparatorWidgetClass, filePD, NULL);
     Widget quitItem = XtVaCreateManagedWidget("Quit", xmPushButtonWidgetClass, filePD, NULL);
     XtAddCallback(quitItem, XmNactivateCallback, &RoadrunnerWindow::quitCB, (XtPointer)this);
@@ -788,11 +794,14 @@ void RoadrunnerWindow::onGenerate() {
     if (prompt)  XtFree(prompt);
     if (seedTxt) XtFree(seedTxt);
     if (!ok) { setStatus("Send failed."); close(fd); XtSetSensitive(_generate, True); return; }
+    armReceive(fd);
+}
 
+// Clear the batch, reset progress, and hand the socket to the Xt event loop so
+// onInput() drains the tagged reply stream. Shared by Generate and Outpaint.
+void RoadrunnerWindow::armReceive(int fd) {
     clearBatch();
     _progPermille = 0; drawProgress();
-
-    // Hand the socket to the Xt event loop; onInput() parses the tagged stream.
     fcntl(fd, F_SETFL, O_NONBLOCK);
     _fd = fd;
     _rxLen = 0; _rxHead = 0;
@@ -800,6 +809,56 @@ void RoadrunnerWindow::onGenerate() {
     XtAppContext ctx = XtWidgetToApplicationContext(_canvas);
     _inputId = XtAppAddInput(ctx, fd, (XtPointer)XtInputReadMask,
                              &RoadrunnerWindow::inputCB, (XtPointer)this);
+}
+
+// Outpaint the currently-shown image: send it as the OUTPAINT source; the bridge
+// composites the zoom-out canvas + border mask and inpaints the new border.
+void RoadrunnerWindow::outpaintCB(Widget, XtPointer client, XtPointer) {
+    ((RoadrunnerWindow*)client)->onOutpaint();
+}
+
+void RoadrunnerWindow::onOutpaint() {
+    if (_fd >= 0) return;
+    if (!_curRGB) { setStatus("Outpaint: generate or select an image first."); return; }
+    XtSetSensitive(_generate, False);
+    setStatus("Connecting to sparky...");
+    int fd = connectBridge();
+    if (fd < 0) { setStatus("Cannot reach the bridge."); XtSetSensitive(_generate, True); return; }
+
+    int steps = 0; XmScaleGetValue(_steps, &steps);
+    if (steps < 12) steps = 12;                          // outpaint likes a few more
+    long seed = -1; char* seedTxt = XmTextFieldGetString(_seed);
+    if (seedTxt && seedTxt[0]) seed = strtol(seedTxt, NULL, 10);
+    if (seedTxt) XtFree(seedTxt);
+    int cfgv = 10; XmScaleGetValue(_cfg, &cfgv);
+    int varv = 0;  XmScaleGetValue(_var, &varv);
+    long seedVar = (varv > 0) ? (long)(rand() & 0x7fffffff) : 0;
+    int cfg100 = cfgv * 10;
+    const char* modelTok = (_model[0] && strcmp(_model, "(default)") != 0) ? _model : "-";
+
+    char header[320];   // OUTPAINT reuses the REMIX field layout; strength forced by the bridge
+    sprintf(header, "OUTPAINT %d %d %ld %d %d %d %d %d %ld %d %s\n",
+            _res, steps, seed, 1, 90, _curW, _curH, cfg100, seedVar, varv, modelTok);
+    char* prompt  = XmTextGetString(_prompt);
+    char* negTxt  = XmTextFieldGetString(_negative);
+    if (prompt) for (char* q = prompt; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+    if (negTxt) for (char* q = negTxt; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+    int ok = send_all(fd, header, (int)strlen(header)) &&
+             send_all(fd, prompt ? prompt : "", prompt ? (int)strlen(prompt) : 0) &&
+             send_all(fd, "\n", 1) &&
+             send_all(fd, negTxt ? negTxt : "", negTxt ? (int)strlen(negTxt) : 0) &&
+             send_all(fd, "\n", 1) &&
+             send_all(fd, _curRGB, (long)_curW * _curH * 3);
+
+    if (_lastPrompt) free(_lastPrompt);
+    _lastPrompt = strdup(prompt ? prompt : "");
+    strncpy(_lastModelSel, _model, sizeof(_lastModelSel) - 1);
+    _lastModelSel[sizeof(_lastModelSel) - 1] = '\0';
+    _lastRes = _res; _lastSteps = steps;
+    if (prompt) XtFree(prompt);
+    if (negTxt) XtFree(negTxt);
+    if (!ok) { setStatus("Send failed."); close(fd); XtSetSensitive(_generate, True); return; }
+    armReceive(fd);
 }
 
 // -- grow the receive buffer by n bytes; 0 on OOM -----------------------------

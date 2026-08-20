@@ -92,6 +92,9 @@ Using it:
 - **Zoom / pan** — the canvas fits the image to the window by default (so a 1024 in a
   small window is never clipped). **Zoom− / Fit / 1:1 / Zoom+** buttons scale it, and
   you **drag with the left button to pan** when zoomed in (SGI mice have no wheel).
+- **File → Outpaint shown image** — sends the current image to the bridge, which
+  zooms it out and inpaints the new border (the prompt describes the wider scene).
+  Works best on full scenes; an image on a plain background has little to extend.
 - **File → Save Image + Params…** — saves the *currently shown* image: `<name>.png`
   (real PNG, via bundled `stb_image_write`) plus a `<name>.txt` sidecar with prompt,
   model, res, steps, that image's exact seed, and size — enough to reproduce it.
@@ -128,9 +131,14 @@ LIST\n                                          -> model names, one per line, th
 GEN <res> <steps> <seed> <count> <model>\n      <model> is a name, or "-" = default
 <prompt>\n                                      (second line, GEN only)
 
-REMIX <res> <steps> <seed> <count> <strengthx100> <imgW> <imgH> <model>\n
+REMIX <res> <steps> <seed> <count> <strengthx100> <imgW> <imgH> <cfgx100> <seedVar> <varx100> <model>\n
 <prompt>\n
+<negative>\n
 <imgW*imgH*3 raw RGB bytes>                      client pre-crops to square
+
+OUTPAINT ...                                     same fields/payload as REMIX; the
+                                                 bridge composites a zoom-out canvas
+                                                 + border mask and inpaints the border
 ```
 
 `seed < 0` → the bridge randomises. The `GEN` response is a **stream of tagged
