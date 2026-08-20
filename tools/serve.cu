@@ -58,11 +58,19 @@
   static inline int  sock_recv(sock_t s, void* b, int n){ return recv(s,(char*)b,n,0); }
   static inline int  sock_send(sock_t s, const void* b, size_t n){ return send(s,(const char*)b,(int)n,0); }
   static inline void ignore_sigpipe(){}                 // Windows raises no SIGPIPE
+  static inline bool sock_timed_out(){ return WSAGetLastError() == WSAETIMEDOUT; }
+  static inline void set_io_timeouts(sock_t s, int sec){
+      DWORD ms = (DWORD)sec * 1000;                     // Winsock wants milliseconds
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof ms);
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof ms);
+  }
 #else
   #include <arpa/inet.h>
+  #include <cerrno>
   #include <csignal>
   #include <netinet/in.h>
   #include <sys/socket.h>
+  #include <sys/time.h>
   #include <unistd.h>
   using sock_t = int;
   static inline void net_startup(){}
@@ -71,6 +79,14 @@
   static inline int  sock_recv(sock_t s, void* b, int n){ return (int)::read(s,b,(size_t)n); }
   static inline int  sock_send(sock_t s, const void* b, size_t n){ return (int)::write(s,b,n); }
   static inline void ignore_sigpipe(){ std::signal(SIGPIPE, SIG_IGN); }
+  static inline bool sock_timed_out(){ return errno == EAGAIN || errno == EWOULDBLOCK; }
+  // SO_RCVTIMEO/SO_SNDTIMEO govern ::read/::write on a socket just as they do
+  // recv/send, so the shim above stays as-is.
+  static inline void set_io_timeouts(sock_t s, int sec){
+      timeval tv{}; tv.tv_sec = sec; tv.tv_usec = 0;
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+  }
 #endif
 
 #include <algorithm>
@@ -606,10 +622,35 @@ struct Worker {
     }
 };
 
-// read one '\n'-terminated line from fd
-bool read_line(sock_t fd, std::string& line){
+// read one '\n'-terminated line from fd.
+//
+// This loop is the whole server: it is single-threaded and strictly serial, so
+// whatever blocks here blocks *every* client. Without a recv timeout a peer that
+// connects and then goes silent — an iPad dropping off Tailscale mid-request is
+// the classic — parks the accept loop forever. The process stays alive and the
+// port stays bound, so systemd's Restart=always cannot see it and `is-active`
+// reports "active" while every request times out. set_io_timeouts() on the
+// accepted socket turns that into an EAGAIN we can walk away from.
+//
+// The timeout is per-recv and therefore idle-only: any byte arriving resets it,
+// so a slow-but-live client is never cut off. Requests are one short JSON line
+// (both front-ends pass images as file paths, not inline data), so a stall this
+// long means the peer has genuinely stopped talking.
+enum class LineStatus { Ok, Closed, TimedOut };
+
+LineStatus read_line(sock_t fd, std::string& line){
     line.clear(); char c;
-    while(true){ int n=sock_recv(fd,&c,1); if(n<=0) return !line.empty(); if(c=='\n') return true; line+=c; }
+    while(true){
+        int n=sock_recv(fd,&c,1);
+        if(n<=0){
+            if(n<0 && sock_timed_out()) return LineStatus::TimedOut;
+            // n==0 is a clean half-close. Keep the historical behaviour of
+            // honouring a request terminated by EOF instead of '\n'.
+            return line.empty() ? LineStatus::Closed : LineStatus::Ok;
+        }
+        if(c=='\n') return LineStatus::Ok;
+        line+=c;
+    }
 }
 
 // send() may write fewer bytes than asked (notably on Winsock); a short write
@@ -625,8 +666,20 @@ int main(int argc,char**argv){
     net_startup();                   // WSAStartup on Windows; no-op on POSIX
     ignore_sigpipe();                // a client disconnecting mid-stream must not kill us (POSIX)
     int port=8765;
+    // Idle timeout applied to each accepted socket, both directions. 0 disables
+    // it (the old, wedge-prone behaviour) if a client ever needs to hold a
+    // connection open silently.
+    //
+    // 15s is chosen against two bounds. Lower: every client sends its one short
+    // JSON line immediately after connecting, so any real request is well under
+    // a second. Upper: a stalled peer blocks the serial accept loop until it is
+    // reaped, so this is also the worst-case delay it can inflict on the next
+    // client — and it must stay below f2k_watchdog.sh's 20s probe timeout, or a
+    // stall being reaped normally would cost the watchdog a spurious strike.
+    int io_timeout=15;
     for(int i=1;i<argc;++i){ std::string a=argv[i];
         if(a=="--port"&&i+1<argc) port=std::atoi(argv[++i]);
+        else if(a=="--io-timeout"&&i+1<argc) io_timeout=std::atoi(argv[++i]);
         else if(a=="--transformer"&&i+1<argc) g_tf_default=argv[++i];
         else if(a=="--model"&&i+1<argc) g_model_default=argv[++i]; }
     // Bind FIRST, before the ~12s model load: a port clash should fail fast and
@@ -654,10 +707,27 @@ int main(int argc,char**argv){
     std::fprintf(stderr,"[worker] ready, listening on 127.0.0.1:%d\n",port);
     while(true){
         sock_t fd=accept(srv,nullptr,nullptr); if(!sock_valid(fd)) continue;
+        if(io_timeout>0) set_io_timeouts(fd,io_timeout);
         std::string line; json resp;
+        // A stalled peer is dropped rather than answered: replying would just
+        // block again (bounded by SO_SNDTIMEO, but pointlessly). Closing frees
+        // the accept loop for everyone else, which is the entire point.
+        const LineStatus st=read_line(fd,line);
+        if(st==LineStatus::TimedOut){
+            std::fprintf(stderr,"[worker] client stalled mid-request; dropped after %ds\n",io_timeout);
+            sock_close(fd); continue;
+        }
         // emit writes one '\n'-delimited JSON line (progress events) to the client.
-        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!send_all(fd,s.data(),s.size()); };
-        if(read_line(fd,line)){
+        // Once a write fails (dead or wedged reader) stop emitting: with
+        // SO_SNDTIMEO each further event would otherwise burn the full timeout,
+        // turning one gone client into minutes of stalled generation.
+        bool client_gone=false;
+        auto emit=[&](const json& j){
+            if(client_gone) return;
+            std::string s=j.dump()+"\n";
+            if(!send_all(fd,s.data(),s.size())) client_gone=true;
+        };
+        if(st==LineStatus::Ok){
             try { resp=w.generate(json::parse(line), emit); }
             catch(const std::exception& e){ resp=json{{"ok",false},{"error",std::string("parse/exec: ")+e.what()}}; }
         } else resp=json{{"ok",false},{"error","empty request"}};

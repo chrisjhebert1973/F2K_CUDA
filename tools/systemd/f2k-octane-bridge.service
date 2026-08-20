@@ -1,0 +1,20 @@
+[Unit]
+Description=F2K_CUDA Octane bridge (Roadrunner client protocol, port 1974)
+After=network.target f2k-worker.service
+# Soft dependency: the bridge binds :1974 and discovers models from ~/models on
+# its own, so it starts fine without the worker. It only needs :8765 per request.
+Wants=f2k-worker.service
+
+[Service]
+Type=simple
+User=chris
+Group=chris
+# The bridge mirrors the web UI's model discovery under $HOME/models.
+Environment=HOME=/home/chris
+WorkingDirectory=/home/chris/Documents/Development/Cpp/Projects/F2KTest
+ExecStart=/home/chris/Documents/Development/Cpp/Projects/F2KTest/build/octane_bridge --port 1974 --worker-port 8765 --model flux2-klein-4B --precision fp8
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
