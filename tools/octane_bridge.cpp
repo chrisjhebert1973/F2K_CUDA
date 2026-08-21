@@ -29,7 +29,8 @@
 //                                          token "-" => bridge default
 //     line 2:  "<prompt>\n"               UTF-8 text, no embedded newline
 //     line 3:  "<negative>\n"             CFG unconditional prompt (may be empty)
-//   ("LIST\n" instead returns newline-separated model names, then EOF.)
+//   ("LIST\n" instead returns newline-separated model names, then EOF.
+//    "CAPS\n" returns key=value request limits, then EOF.)
 //   Remix (img2img): "REMIX <res> <steps> <seed> <count> <strengthx100> <imgW>
 //     <imgH> <cfgx100> <seedVar> <varx100> <model>\n" then "<prompt>\n" then
 //     "<negative>\n" then imgW*imgH*3 raw RGB bytes. The client pre-crops to
@@ -78,6 +79,17 @@ namespace {
 constexpr char     MAGIC[4] = {'F', '2', 'K', '1'};
 constexpr uint32_t MAX_PROMPT = 4000;          // sanity cap on a request line
 const int          RES_OK[] = {256, 512, 768, 1024};   // worker-legal sizes
+
+// The one source of truth for request limits. The clamp block below and the CAPS
+// verb both read these, so a client that queries CAPS cannot be told a table the
+// bridge does not actually enforce.
+const int RES_FALLBACK   = 512;   // an out-of-range res becomes this, NOT the nearest
+const int STEPS_MIN = 1,   STEPS_MAX = 30;
+const int COUNT_MIN = 1,   COUNT_MAX = 8;
+const int STR_MIN   = 5,   STR_MAX   = 100;
+const int VAR_MIN   = 0,   VAR_MAX   = 100;
+const int OUTPAINT_STR_TRIGGER = 80;  // below this, outpaint raises strength...
+const int OUTPAINT_STR_SET     = 90;  // ...to this, so the border can fill freely
 const std::string  STOCK   = "flux2-klein-9B"; // the worker's built-in default
 
 std::string g_worker_host = "127.0.0.1";
@@ -246,9 +258,13 @@ std::vector<std::string> list_models() {
 }
 
 // Fill in the worker's {model, transformer, precision} fields for a requested
+// checkpoint name, and report back which checkpoint actually won (via
+// `resolved`) -- the request name is not always what runs: "-" means the
+// bridge default, and an unknown or unusable name falls back to stock.
 // checkpoint name. "" / "-" => the bridge default; the stock name or an unknown
 // checkpoint => leave them unset so the worker uses its built-in 9B.
-void resolve_model(std::string name, json& job) {
+void resolve_model(std::string name, json& job, std::string* resolved) {
+    if (resolved) *resolved = STOCK;
     if (name.empty() || name == "-") name = g_model;
     if (name.empty() || name == STOCK) return;
     const fs::path root = (name[0] == '/') ? fs::path(name) : fs::path(models_dir()) / name;
@@ -262,6 +278,7 @@ void resolve_model(std::string name, json& job) {
         tf = alt; chosen = want_fp8 ? "nvfp4" : "fp8";
     }
     job["precision"] = chosen;
+    if (resolved) *resolved = name;
     if (fs::is_directory(root / "qwen3_f2k")) job["model"] = root.string();   // full root
     else                                      job["transformer"] = tf.string(); // 9B overlay
 }
@@ -349,6 +366,35 @@ void handle_client(int fd) {
         return;
     }
 
+    // CAPS: the request limits, machine-readable. Exists so a tool-calling client
+    // does not have to keep its own copy of this table and silently drift when the
+    // bridge changes -- key=value lines, then EOF, same shape as LIST. Additive:
+    // nothing that does not send CAPS is affected.
+    if (head == "CAPS") {
+        std::string out = "protocol=1\n";
+        out += "res=";
+        for (size_t i = 0; i < sizeof(RES_OK) / sizeof(RES_OK[0]); ++i) {
+            if (i) out += ',';
+            out += std::to_string(RES_OK[i]);
+        }
+        out += "\n";
+        out += "res_fallback=" + std::to_string(RES_FALLBACK) + "\n";
+        out += "steps=" + std::to_string(STEPS_MIN) + ".." + std::to_string(STEPS_MAX) + "\n";
+        out += "count=" + std::to_string(COUNT_MIN) + ".." + std::to_string(COUNT_MAX) + "\n";
+        out += "strength=" + std::to_string(STR_MIN) + ".." + std::to_string(STR_MAX) + "\n";
+        out += "var=" + std::to_string(VAR_MIN) + ".." + std::to_string(VAR_MAX) + "\n";
+        out += "outpaint_strength_trigger=" + std::to_string(OUTPAINT_STR_TRIGGER) + "\n";
+        out += "outpaint_strength_set=" + std::to_string(OUTPAINT_STR_SET) + "\n";
+        out += "cfg_off=100\n";                     // cfgx100 == 100 disables CFG
+        out += "default_res=512\ndefault_steps=4\n";
+        out += "verbs=LIST,CAPS,GEN,REMIX,OUTPAINT\n";
+        out += "clamp_report=progress-phase\n";     // "clamped: res 640->512; ..."
+        out += "model_report=progress-phase\n";     // "model: <name> <precision>"
+        send_all(fd, out.data(), out.size());
+        std::fprintf(stderr, "[bridge] CAPS\n");
+        return;
+    }
+
     // GEN   <res> <steps> <seed> <count> <cfg> <seedVar> <var> <model>
     // REMIX / OUTPAINT: same as GEN but with <strengthx100> <imgW> <imgH> before
     //   <cfg>, and imgW*imgH*3 raw RGB bytes after the two text lines. OUTPAINT
@@ -375,7 +421,7 @@ void handle_client(int fd) {
                     &cfg100, &seed_var, &var100, modelbuf);
     }
     if (cfg100 < 0) cfg100 = 100;
-    if (var100 < 0) var100 = 0; if (var100 > 100) var100 = 100;
+    if (var100 < VAR_MIN) var100 = VAR_MIN; if (var100 > VAR_MAX) var100 = VAR_MAX;
 
     // What the client actually asked for, before any adjustment below. Clamping
     // is silent on the wire by design -- the Octane can do nothing useful with an
@@ -398,7 +444,7 @@ void handle_client(int fd) {
             if (!stage_outpaint(rgb.data(), imgW, imgH, R, 2.0f, init_png, mask_png)) {
                 msg_error(fd, "stage outpaint failed"); return;
             }
-            if (strength100 < 80) strength100 = 90;      // outpaint needs to fill freely
+            if (strength100 < OUTPAINT_STR_TRIGGER) strength100 = OUTPAINT_STR_SET;  // fill freely
         } else {
             char ip[256];
             std::snprintf(ip, sizeof ip, "/tmp/octane_init_%d_%u.png",
@@ -418,13 +464,13 @@ void handle_client(int fd) {
     // clamp to worker-legal values so a typo can't cost a worker error round-trip
     bool res_ok = false;
     for (int r : RES_OK) if (r == res) res_ok = true;
-    if (!res_ok) res = 512;
-    if (steps < 1)  steps = 1;
-    if (steps > 30) steps = 30;
-    if (count < 1)  count = 1;
-    if (count > 8)  count = 8;
-    if (strength100 < 5)   strength100 = 5;
-    if (strength100 > 100) strength100 = 100;
+    if (!res_ok) res = RES_FALLBACK;
+    if (steps < STEPS_MIN) steps = STEPS_MIN;
+    if (steps > STEPS_MAX) steps = STEPS_MAX;
+    if (count < COUNT_MIN) count = COUNT_MIN;
+    if (count > COUNT_MAX) count = COUNT_MAX;
+    if (strength100 < STR_MIN) strength100 = STR_MIN;
+    if (strength100 > STR_MAX) strength100 = STR_MAX;
     if (prompt.empty()) { msg_error(fd, "empty prompt"); cleanup(); return; }
 
     // Report those adjustments before the batch starts. PROGRESS already carries
@@ -464,7 +510,16 @@ void handle_client(int fd) {
         json job = {{"prompt", prompt}, {"res", res}, {"precision", g_precision},
                     {"steps", steps}, {"seed", static_cast<int64_t>(seed)}, {"out", out},
                     {"stream", true}, {"preview", false}};   // cheap per-step progress
-        resolve_model(modelbuf, job);
+        std::string resolved;
+        resolve_model(modelbuf, job, &resolved);
+        if (idx == 0) {
+            // Which checkpoint and quant actually ran. "-" and unknown names both
+            // resolve silently otherwise, leaving a tool caller to report "(default)"
+            // when it could report the truth.
+            msg_progress(fd, 0, (uint32_t)count, 0,
+                         "model: " + resolved + " " +
+                         job.value("precision", g_precision));
+        }
         if (!init_png.empty()) {
             job["init_image"] = init_png;
             job["strength"]   = strength100 / 100.0;
