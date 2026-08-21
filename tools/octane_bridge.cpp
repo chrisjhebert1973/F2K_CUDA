@@ -377,6 +377,12 @@ void handle_client(int fd) {
     if (cfg100 < 0) cfg100 = 100;
     if (var100 < 0) var100 = 0; if (var100 > 100) var100 = 100;
 
+    // What the client actually asked for, before any adjustment below. Clamping
+    // is silent on the wire by design -- the Octane can do nothing useful with an
+    // error -- but a tool-calling client needs to know it asked for one thing and
+    // was handed another, so the differences are reported as a PROGRESS phase.
+    const int req_res = res, req_steps = steps, req_count = count, req_str = strength100;
+
     // Pull the raw RGB payload and stage it for the worker: remix uses it directly
     // as the init image; outpaint composites a canvas + border mask from it.
     std::string init_png, mask_png;
@@ -420,6 +426,25 @@ void handle_client(int fd) {
     if (strength100 < 5)   strength100 = 5;
     if (strength100 > 100) strength100 = 100;
     if (prompt.empty()) { msg_error(fd, "empty prompt"); cleanup(); return; }
+
+    // Report those adjustments before the batch starts. PROGRESS already carries
+    // a free-text phase, so this needs no new message type and no framing change:
+    // a client that ignores phase text sees exactly what it saw before.
+    std::string clamped;
+    auto note = [&clamped](const char* what, int from, int to) {
+        if (from == to) return;
+        if (!clamped.empty()) clamped += "; ";
+        clamped += what;
+        clamped += ' ' + std::to_string(from) + "->" + std::to_string(to);
+    };
+    note("res",   req_res,   res);
+    note("steps", req_steps, steps);
+    note("count", req_count, count);
+    if (has_img) note("strength", req_str, strength100);   // incl. the outpaint floor
+    if (!clamped.empty()) {
+        std::fprintf(stderr, "[bridge] clamped: %s\n", clamped.c_str());
+        msg_progress(fd, 0, (uint32_t)count, 0, "clamped: " + clamped);
+    }
 
     const char* kind = outpaint ? "outpaint" : (remix ? "remix" : "batch");
     std::fprintf(stderr, "[bridge] %s res=%d steps=%d seed=%ld count=%d%s model=%s prompt=\"%.50s\"\n",
