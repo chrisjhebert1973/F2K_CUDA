@@ -21,15 +21,21 @@ Run metadata (one JSON per run, in runs/):
 Older single-image runs (no `images` key, png named <id>.png) are normalised on
 read by _normalise().
 """
-import os, re, json, time, hmac, secrets, subprocess, threading, socket, base64
+import os, re, glob, json, time, hmac, secrets, subprocess, threading, socket, base64
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for, abort,
-                   render_template_string, send_from_directory, flash, Response)
+                   render_template_string, send_from_directory, send_file, flash, Response)
+from werkzeug.security import safe_join
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GENERATE = os.path.join(ROOT, "build", "generate")
 RUNS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
 os.makedirs(RUNS, exist_ok=True)
+THUMBS = os.path.join(RUNS, ".thumbs")     # cached low-res gallery previews
+os.makedirs(THUMBS, exist_ok=True)
+THUMB_MAX = 384                            # longest-edge px for grid thumbnails
+GALLERY_PER_PAGE = 64                      # default thumbnails per gallery page
+PER_PAGE_CHOICES = [32, 64, 128]
 
 USER = os.environ.get("F2K_WEB_USER", "chris")
 PASSWORD = os.environ.get("F2K_WEB_PASSWORD", "rocket")
@@ -39,6 +45,75 @@ RES_CHOICES = ["256", "512", "768", "1024"]
 PREC_CHOICES = ["fp8", "nvfp4"]
 COUNT_CHOICES = [1, 2, 4, 8]
 MAX_COUNT = 8
+MODELS_ROOT = os.path.expanduser("~/models")
+STOCK_MODEL = "flux2-klein-9B"
+DEFAULT_MODEL = os.environ.get("F2K_DEFAULT_MODEL", "flux2-klein-4B")
+_PREC_SUBDIR = {"fp8": "transformer_mxfp8", "nvfp4": "transformer_f2k"}
+
+def list_models():
+    """Checkpoint roots the worker can serve: any ~/models/<name> holding a
+    transformer_* dir with .f2k1 shards (see tools/bfl_to_diffusers.py for how
+    finetunes get there). Stock klein-9B first."""
+    out = []
+    try:
+        for name in sorted(os.listdir(MODELS_ROOT)):
+            if any(glob.glob(os.path.join(MODELS_ROOT, name, sub, "*.f2k1"))
+                   for sub in _PREC_SUBDIR.values()):
+                out.append(name)
+    except OSError:
+        pass
+    if STOCK_MODEL in out:
+        out.remove(STOCK_MODEL); out.insert(0, STOCK_MODEL)
+    return out
+
+def _model_fields(model, precision):
+    """Worker payload fields {model, transformer} for a selected checkpoint.
+    Full model roots (own qwen3_f2k encoder, e.g. klein-4B) → model=<root>;
+    transformer-only dirs (klein-9B finetunes like truev2) → overlay on stock.
+    None if the requested quant doesn't exist for this checkpoint."""
+    if not model or model == STOCK_MODEL:
+        return {"model": "", "transformer": ""}
+    root = os.path.join(MODELS_ROOT, model)
+    tf = os.path.join(root, _PREC_SUBDIR.get(precision, "transformer_mxfp8"))
+    if not glob.glob(os.path.join(tf, "*.f2k1")):
+        return None
+    if os.path.isdir(os.path.join(root, "qwen3_f2k")):
+        return {"model": root, "transformer": ""}
+    return {"model": "", "transformer": tf}
+
+def _load_triggers():
+    """Map @mention -> trained trigger phrase, from <model_root>/trigger.json.
+    Each character checkpoint (train_character.sh) drops a trigger.json like
+    {"mention": "rocket", "phrase": "r0cket, a black and white Akita husky dog"}.
+    The phrase carries both the rare trigger token AND the class anchor, so a
+    bare "@rocket ..." prompt can never collide with a base-model concept (the
+    spaceship problem)."""
+    out = {}
+    try:
+        for name in os.listdir(MODELS_ROOT):
+            tj = os.path.join(MODELS_ROOT, name, "trigger.json")
+            if not os.path.isfile(tj):
+                continue
+            try:
+                d = json.load(open(tj))
+                m = (d.get("mention") or "").strip().lower()
+                if m and d.get("phrase"):
+                    out[m] = d["phrase"]
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return out
+
+def expand_triggers(prompt):
+    """Rewrite @mention -> trigger phrase before the prompt reaches the encoder.
+    Unknown @mentions are left untouched."""
+    triggers = _load_triggers()
+    if not triggers or "@" not in prompt:
+        return prompt
+    return re.sub(r"@([A-Za-z0-9_]+)",
+                  lambda mo: triggers.get(mo.group(1).lower(), mo.group(0)),
+                  prompt)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("F2K_SECRET", secrets.token_hex(16))
@@ -110,6 +185,39 @@ def list_images(runs=None):
                                   prompt=m.get("prompt", ""), seed=im.get("seed", 0)))
     return cards
 
+def gallery_view(page=1, per_page=GALLERY_PER_PAGE):
+    """For the gallery: a single page of successful images, grouped by batch
+    (run) for display, plus a flat list the lightbox pages through (prev/next
+    flows across the current page). Each thumbnail carries its index into
+    `flat`. Returns (batches, flat, pg) where pg holds pagination metadata."""
+    # Flatten every successful image newest-first, then slice to the page.
+    all_imgs = []
+    for m in list_runs():
+        for im in m["images"]:
+            if im.get("ok"):
+                all_imgs.append((m, im))
+    total = len(all_imgs)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, pages))
+    start = (page - 1) * per_page
+    chunk = all_imgs[start:start + per_page]
+
+    batches, flat, cur = [], [], None
+    for m, im in chunk:
+        gi = len(flat)
+        flat.append(dict(file=im["file"], prompt=m.get("prompt", ""),
+                         seed=im.get("seed", 0), rid=m["id"]))
+        if cur is None or cur["rid"] != m["id"]:
+            cur = dict(rid=m["id"], prompt=m.get("prompt", ""),
+                       when=m.get("when", ""), kind=m.get("kind", ""), images=[])
+            batches.append(cur)
+        cur["images"].append(dict(gi=gi, file=im["file"], seed=im.get("seed", 0)))
+    for b in batches:
+        b["count"] = len(b["images"])
+    pg = dict(page=page, pages=pages, total=total, per_page=per_page,
+              start=start + 1 if total else 0, end=start + len(chunk))
+    return batches, flat, pg
+
 # ----------------------------------------------------------------- worker
 def _worker_call(payload, timeout=600):
     """Send one job to the persistent worker; raises OSError if it's not up."""
@@ -148,10 +256,14 @@ def _worker_stream(payload, timeout=600):
     finally:
         s.close()
 
-def _subprocess_call(out_png, prompt, res, precision, steps, seed):
+def _subprocess_call(out_png, prompt, res, precision, steps, seed, fields=None):
     """Fallback: one-shot generate binary (slow — reloads the model)."""
     args = [GENERATE, "--prompt", prompt, "--res", str(res), "--precision", precision,
             "--steps", str(steps), "--seed", str(seed), "--out", out_png]
+    if fields and fields.get("model"):
+        args += ["--model", fields["model"]]
+    if fields and fields.get("transformer"):
+        args += ["--transformer", fields["transformer"]]
     proc = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=600)
     log = (proc.stdout or "") + (proc.stderr or "")
     timing = [ln.strip() for ln in log.splitlines()
@@ -159,28 +271,39 @@ def _subprocess_call(out_png, prompt, res, precision, steps, seed):
     return dict(ok=(proc.returncode == 0 and os.path.exists(out_png)), timing=timing,
                 error=(log[-1500:] if proc.returncode != 0 else ""))
 
-def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None, kind=None):
+def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=None, kind=None,
+              model="", extra=None, mask_image=None):
     """Generate len(seeds) images for one prompt, serialised on the GPU lock.
     If init_image (abs path) is given, runs img2img at the given strength — only
     the persistent worker supports this; the subprocess fallback is txt2img.
-    `kind` tags the run (e.g. 'upscale 2048px') for the result banner."""
+    `kind` tags the run (e.g. 'upscale 2048px') for the result banner.
+    `model` selects an alternate checkpoint from list_models() ('' = stock)."""
+    prompt = expand_triggers(prompt)
     rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
     images, mode, err = [], "worker", ""
+    fields = _model_fields(model, precision)
+    if fields is None:   # checkpoint exists but not in this quant
+        fields = {"model": "", "transformer": ""}
+        model = STOCK_MODEL
     t0 = time.time()
     with _gpu_lock:
         for i, seed in enumerate(seeds):
             fn = f"{rid}_{i}.png"
             out_png = os.path.join(RUNS, fn)
             payload = dict(prompt=prompt, res=res, precision=precision,
-                           steps=steps, seed=seed, out=out_png)
+                           steps=steps, seed=seed, out=out_png, **fields)
             if init_image:
                 payload["init_image"] = init_image
                 payload["strength"] = strength
+            if mask_image:
+                payload["mask_image"] = mask_image
+            if extra:
+                payload.update(extra)
             try:
                 r = _worker_call(payload)
             except OSError:
                 mode = "subprocess (worker down)"
-                r = _subprocess_call(out_png, prompt, res, precision, steps, seed)
+                r = _subprocess_call(out_png, prompt, res, precision, steps, seed, fields)
             if not r.get("ok") and not err:
                 err = r.get("error", "")
             images.append(dict(seed=seed, file=fn, ok=r.get("ok", False),
@@ -188,14 +311,38 @@ def run_batch(prompt, res, precision, steps, seeds, init_image=None, strength=No
     meta = dict(id=rid, prompt=prompt, res=res, precision=precision, steps=steps,
                 count=len(seeds), ok=any(im["ok"] for im in images),
                 elapsed=round(time.time() - t0, 1), error=err, mode=mode,
-                when=time.strftime("%Y-%m-%d %H:%M"), images=images)
+                when=time.strftime("%Y-%m-%d %H:%M"), images=images,
+                model=model or STOCK_MODEL)
     if init_image:
         meta["init_from"] = os.path.basename(init_image)
         meta["strength"] = strength
     if kind:
         meta["kind"] = kind
+    if extra:
+        meta.update({k: extra[k] for k in ("cfg", "negative", "var_strength", "seed_var")
+                     if k in extra})
     save_run(meta)
     return meta
+
+def _parse_extra(form):
+    """Advanced worker fields — negative prompt, CFG scale, variation seed/strength.
+    Only non-default keys are returned, so a plain request stays byte-identical."""
+    out = {}
+    try: cfg = float(form.get("cfg", "1") or 1)
+    except ValueError: cfg = 1.0
+    cfg = max(0.0, min(10.0, cfg))
+    if abs(cfg - 1.0) > 1e-3:
+        out["cfg"] = cfg
+        out["negative"] = (form.get("negative", "") or "").strip()[:800]
+    try: vstr = float(form.get("var_strength", "0") or 0)
+    except ValueError: vstr = 0.0
+    vstr = max(0.0, min(1.0, vstr))
+    if vstr > 0:
+        out["var_strength"] = round(vstr, 2)
+        sv = (form.get("seed_var", "") or "").strip()
+        try: out["seed_var"] = (int(sv) & 0xFFFFFFFF) if sv else secrets.randbits(32)
+        except ValueError: out["seed_var"] = secrets.randbits(32)
+    return out
 
 # ----------------------------------------------------------------- form parsing
 def _parse_common(form):
@@ -214,14 +361,20 @@ def _parse_common(form):
         seeds = [(base + i) & 0xFFFFFFFF for i in range(count)]   # reproducible batch
     else:
         seeds = [secrets.randbits(32) for _ in range(count)]
-    return int(res), precision, steps, seeds
+    model = form.get("model", "")
+    if model and model not in list_models():
+        model = ""
+    return int(res), precision, steps, seeds, model
 
 # ----------------------------------------------------------------- routes
 @app.route("/")
 @login_required
 def index():
+    models = list_models()
+    default_model = DEFAULT_MODEL if DEFAULT_MODEL in models else STOCK_MODEL
     return render_template_string(INDEX, res_choices=RES_CHOICES, prec_choices=PREC_CHOICES,
-                                  count_choices=COUNT_CHOICES, cards=list_images()[:12])
+                                  count_choices=COUNT_CHOICES, model_choices=models,
+                                  default_model=default_model, cards=list_images()[:12])
 
 @app.route("/generate", methods=["POST"])
 @login_required
@@ -229,8 +382,8 @@ def generate():
     prompt = (request.form.get("prompt", "") or "").strip()[:800]
     if not prompt:
         flash("Enter a prompt."); return redirect(url_for("index"))
-    res, precision, steps, seeds = _parse_common(request.form)
-    meta = run_batch(prompt, res, precision, steps, seeds)
+    res, precision, steps, seeds, model = _parse_common(request.form)
+    meta = run_batch(prompt, res, precision, steps, seeds, model=model)
     return redirect(url_for("result", rid=meta["id"]))
 
 @app.route("/generate_stream", methods=["POST"])
@@ -240,10 +393,12 @@ def generate_stream():
     browser, saves the run, then emits {event:complete,rid}. Handles plain txt2img
     and remix-from-an-existing-output (src_rid/src_idx + strength)."""
     prompt = (request.form.get("prompt", "") or "").strip()[:800]
-    res, precision, steps, seeds = _parse_common(request.form)
+    res, precision, steps, seeds, model = _parse_common(request.form)
     # optional remix init from an existing output
     init_image = None; strength = None; kind = None
     src = load_run(request.form.get("src_rid", "")) if request.form.get("src_rid") else None
+    if src and not model:
+        model = src.get("model", "")   # remix/inpaint inherit the source checkpoint
     if src:
         try: si = int(request.form.get("src_idx", "0"))
         except ValueError: si = 0
@@ -257,12 +412,19 @@ def generate_stream():
                 if not prompt: prompt = src.get("prompt", "")
     if not prompt:
         return Response('{"event":"error","msg":"empty prompt"}\n', mimetype="application/x-ndjson")
+    prompt = expand_triggers(prompt)
     # optional inpaint mask (painted in the browser), as a data URL
     mask_bytes = None
     md = request.form.get("mask_data", "")
     if init_image and md.startswith("data:image"):
         try: mask_bytes = base64.b64decode(md.split(",", 1)[1])
         except Exception: mask_bytes = None
+
+    fields = _model_fields(model, precision)
+    if fields is None:   # checkpoint exists but not in this quant
+        fields = {"model": "", "transformer": ""}
+        model = STOCK_MODEL
+    extra = _parse_extra(request.form)   # read in request context, before streaming
 
     def gen():
         rid = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
@@ -277,11 +439,14 @@ def generate_stream():
                 fn = f"{rid}_{i}.png"
                 out_png = os.path.join(RUNS, fn)
                 payload = dict(prompt=prompt, res=res, precision=precision,
-                               steps=steps, seed=seed, out=out_png, stream=True)
+                               steps=steps, seed=seed, out=out_png, stream=True,
+                               **fields)
                 if init_image:
                     payload["init_image"] = init_image; payload["strength"] = strength
                 if mask_path:
                     payload["mask_image"] = mask_path
+                if extra:
+                    payload.update(extra)
                 final = None
                 try:
                     for j in _worker_stream(payload):
@@ -292,7 +457,7 @@ def generate_stream():
                             final = j
                 except OSError:
                     mode = "subprocess (worker down)"
-                    final = _subprocess_call(out_png, prompt, res, precision, steps, seed)
+                    final = _subprocess_call(out_png, prompt, res, precision, steps, seed, fields)
                 final = final or {"ok": False, "error": "no response"}
                 if not final.get("ok") and not err: err = final.get("error", "")
                 images.append(dict(seed=seed, file=fn, ok=final.get("ok", False),
@@ -302,7 +467,11 @@ def generate_stream():
         meta = dict(id=rid, prompt=prompt, res=res, precision=precision, steps=steps,
                     count=len(seeds), ok=any(im["ok"] for im in images),
                     elapsed=round(time.time() - t0, 1), error=err, mode=mode,
-                    when=time.strftime("%Y-%m-%d %H:%M"), images=images)
+                    when=time.strftime("%Y-%m-%d %H:%M"), images=images,
+                    model=model or STOCK_MODEL)
+        if extra:
+            meta.update({k: extra[k] for k in ("cfg", "negative", "var_strength", "seed_var")
+                         if k in extra})
         if init_image:
             meta["init_from"] = os.path.basename(init_image); meta["strength"] = strength
         if mask_path: meta["kind"] = "inpaint"
@@ -350,12 +519,14 @@ def remix():
     init_path = os.path.join(RUNS, os.path.basename(src["images"][src_idx]["file"]))
     if not os.path.exists(init_path): abort(404)
     prompt = (request.form.get("prompt", "") or "").strip()[:800] or src.get("prompt", "")
-    res, precision, steps, seeds = _parse_common(request.form)
+    res, precision, steps, seeds, model = _parse_common(request.form)
+    if not model:
+        model = src.get("model", "")   # remix inherits the source checkpoint
     try: strength = float(request.form.get("strength", "0.6"))
     except ValueError: strength = 0.6
     strength = max(0.05, min(1.0, strength))
     meta = run_batch(prompt, res, precision, steps, seeds,
-                     init_image=init_path, strength=round(strength, 2))
+                     init_image=init_path, strength=round(strength, 2), model=model)
     return redirect(url_for("result", rid=meta["id"]))
 
 def _save_upload_square(file_storage, maxdim=1024):
@@ -390,12 +561,12 @@ def upload_remix():
     if not init_path:
         flash("Could not read that image (HEIC isn't supported — use JPEG/PNG).")
         return redirect(url_for("index"))
-    res, precision, steps, seeds = _parse_common(request.form)
+    res, precision, steps, seeds, model = _parse_common(request.form)
     try: strength = float(request.form.get("strength", "0.55"))
     except ValueError: strength = 0.55
     strength = max(0.05, min(1.0, strength))
     meta = run_batch(prompt, res, precision, steps, seeds,
-                     init_image=init_path, strength=round(strength, 2))
+                     init_image=init_path, strength=round(strength, 2), model=model)
     return redirect(url_for("result", rid=meta["id"]))
 
 UPSCALE_MAX = 2048        # true 2K (Linear gridDim.y fix unblocked 65536 tokens)
@@ -417,7 +588,50 @@ def upscale(rid, idx):
     steps = max(int(m.get("steps", 8)), 12)        # a few more steps help at 2K
     seeds = [im.get("seed", secrets.randbits(32))]  # reuse seed for consistency
     meta = run_batch(m.get("prompt", ""), target, m.get("precision", "fp8"), steps, seeds,
-                     init_image=init_path, strength=UPSCALE_STRENGTH, kind=f"upscale {target}px")
+                     init_image=init_path, strength=UPSCALE_STRENGTH, kind=f"upscale {target}px",
+                     model=m.get("model", ""))
+    return redirect(url_for("result", rid=meta["id"]))
+
+OUTPAINT_ZOOM = 2.0       # zoom-out factor: the source shrinks to 1/zoom of the frame
+OUTPAINT_STRENGTH = 0.9   # fill the new border fairly freely
+
+def _make_outpaint(src_path, out_res, zoom=OUTPAINT_ZOOM):
+    """Zoom-out outpaint: put a shrunken copy of the source in the centre of an
+    out_res square, and return (canvas_path, mask_path) for the inpaint worker.
+    White mask = the new border to fill; a blurred zoom seeds it with plausible
+    colour and the seam is feathered so it blends."""
+    from PIL import Image, ImageDraw, ImageFilter
+    inner = max(64, int(out_res / zoom))
+    off = (out_res - inner) // 2
+    src = Image.open(src_path).convert("RGB").resize((inner, inner), Image.LANCZOS)
+    canvas = (Image.open(src_path).convert("RGB")
+              .resize((out_res, out_res), Image.LANCZOS)
+              .filter(ImageFilter.GaussianBlur(30)))       # blurred fill for the border
+    canvas.paste(src, (off, off))
+    mask = Image.new("L", (out_res, out_res), 255)         # regenerate everywhere...
+    ImageDraw.Draw(mask).rectangle([off, off, off + inner - 1, off + inner - 1], fill=0)  # ...keep centre
+    mask = mask.filter(ImageFilter.GaussianBlur(max(5, out_res // 128)))   # feather the seam
+    tag = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
+    cpath = os.path.join(RUNS, f"outpaint_{tag}.png"); canvas.save(cpath, "PNG")
+    mpath = os.path.join(RUNS, f"outmask_{tag}.png");  mask.save(mpath, "PNG")
+    return cpath, mpath
+
+@app.route("/outpaint/<rid>/<int:idx>", methods=["POST"])
+@login_required
+def outpaint(rid, idx):
+    m = load_run(rid)
+    if not m or idx < 0 or idx >= len(m["images"]): abort(404)
+    im = m["images"][idx]
+    if not im.get("ok"): abort(404)
+    src_path = os.path.join(RUNS, os.path.basename(im["file"]))
+    if not os.path.exists(src_path): abort(404)
+    res = int(m.get("res", 1024))
+    canvas_path, mask_path = _make_outpaint(src_path, res)
+    prompt = (request.form.get("prompt", "") or "").strip()[:800] or m.get("prompt", "")
+    steps = max(int(m.get("steps", 8)), 12)
+    meta = run_batch(prompt, res, m.get("precision", "fp8"), steps, [secrets.randbits(32)],
+                     init_image=canvas_path, mask_image=mask_path,
+                     strength=OUTPAINT_STRENGTH, kind="outpaint", model=m.get("model", ""))
     return redirect(url_for("result", rid=meta["id"]))
 
 @app.route("/delete/<rid>/<int:idx>", methods=["POST"])
@@ -426,7 +640,10 @@ def delete(rid, idx):
     m = load_run(rid)
     if not m or idx < 0 or idx >= len(m["images"]): abort(404)
     im = m["images"][idx]
-    try: os.remove(os.path.join(RUNS, os.path.basename(im["file"])))
+    base = os.path.basename(im["file"])
+    try: os.remove(os.path.join(RUNS, base))
+    except OSError: pass
+    try: os.remove(os.path.join(THUMBS, base.rsplit(".", 1)[0] + ".webp"))
     except OSError: pass
     m["images"].pop(idx)
     if m["images"]:
@@ -434,21 +651,63 @@ def delete(rid, idx):
         save_run(m)
         flash("Deleted one image.")
         return redirect(url_for("result", rid=rid))
-    # last image gone — drop the whole run
+    # last image gone — drop the whole run, then return to where it sat in the
+    # gallery: anchor on the neighbouring batch that now occupies that spot
+    # (next-older, else previous), so the page scrolls back to that position.
+    order = [r["id"] for r in list_runs()]      # newest-first, still includes rid
+    neighbor = None
+    if rid in order:
+        i = order.index(rid)
+        neighbor = order[i + 1] if i + 1 < len(order) else (order[i - 1] if i else None)
     try: os.remove(_meta_path(rid))
     except OSError: pass
     flash("Deleted.")
-    return redirect(request.form.get("back") or url_for("gallery"))
+    dest = request.form.get("back") or url_for("gallery")
+    if neighbor and "gallery" in dest and "#" not in dest:
+        dest += "#b-" + neighbor
+    return redirect(dest)
 
 @app.route("/gallery")
 @login_required
 def gallery():
-    return render_template_string(GALLERY, cards=list_images())
+    # Query params win; otherwise fall back to the last-viewed state in the
+    # session so a redirect to /gallery (e.g. after delete) lands where you were.
+    per = request.args.get("per", type=int)
+    if per not in PER_PAGE_CHOICES:
+        per = session.get("gallery_per", GALLERY_PER_PAGE)
+    page = request.args.get("page", type=int)
+    if not page or page < 1:
+        page = session.get("gallery_page", 1)
+    batches, flat, pg = gallery_view(page, per)
+    session["gallery_per"] = pg["per_page"]    # remember as the default
+    session["gallery_page"] = pg["page"]       # store the clamped, valid page
+    return render_template_string(GALLERY, batches=batches, flat=flat, pg=pg,
+                                  per_choices=PER_PAGE_CHOICES)
 
 @app.route("/img/<path:fn>")
 @login_required
 def img(fn):
     return send_from_directory(RUNS, fn)
+
+@app.route("/thumb/<path:fn>")
+@login_required
+def thumb(fn):
+    """Low-res WebP preview for the gallery grid, generated on first request
+    and cached in runs/.thumbs (regenerated if the source PNG is newer)."""
+    src = safe_join(RUNS, fn)
+    if not src or not os.path.isfile(src):
+        abort(404)
+    tp = os.path.join(THUMBS, os.path.basename(fn).rsplit(".", 1)[0] + ".webp")
+    if not os.path.exists(tp) or os.path.getmtime(tp) < os.path.getmtime(src):
+        try:
+            from PIL import Image
+            with Image.open(src) as im:
+                im = im.convert("RGB")
+                im.thumbnail((THUMB_MAX, THUMB_MAX))
+                im.save(tp, "WEBP", quality=80, method=4)
+        except Exception:
+            return send_from_directory(RUNS, fn)   # fall back to the full image
+    return send_file(tp, mimetype="image/webp")
 
 # ----------------------------------------------------------------- templates
 BASE_CSS = """
@@ -480,6 +739,7 @@ img.gen{width:100%;border-radius:12px;display:block;background:#000}
  background:#3b6cf0;color:#fff;font-weight:600}
 .del{background:#5a2330} .del:active{background:#46101c}
 .up{background:#1f7a6a} .up:active{background:#155448}
+.op{background:#b5651d} .op:active{background:#8a4d16}
 .ip{background:#6c4bd6} .ip:active{background:#553aae}
 .thumb{width:120px;height:120px;object-fit:cover;border-radius:10px;border:1px solid #2c3038}
 output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
@@ -492,6 +752,25 @@ output.sv{color:#9fe0a0;font-variant-numeric:tabular-nums}
  z-index:9;flex-direction:column;gap:14px;text-align:center;padding:20px}
 .spin{width:46px;height:46px;border:5px solid #3b6cf0;border-top-color:transparent;border-radius:50%;
  animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
+.batch{margin:0 0 16px}
+.batch .bh{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin:0 2px 6px}
+.batch .bh a{font-size:14px} .batch .bh .muted{flex:0 0 auto;font-size:12px}
+.gthumb{width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;border:1px solid #2c3038;
+ cursor:zoom-in;display:block}
+#lb .nav{position:fixed;top:50%;transform:translateY(-50%);font-size:46px;line-height:1;color:#fff;
+ opacity:.55;padding:8px 14px;cursor:pointer;user-select:none;-webkit-user-select:none}
+#lb .nav:active{opacity:1} #lbprev{left:4px} #lbnext{right:4px}
+#lb .cap{position:fixed;left:0;right:0;bottom:0;padding:10px 14px;background:#000a;font-size:13px;
+ color:#cfd3db;text-align:center} #lb .cap a{color:#8fb6ff}
+#lb .cap .n{color:#8a8f9c;font-variant-numeric:tabular-nums}
+.pager{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;
+ margin:0 2px 16px;padding:10px 12px;background:#1d2026;border:1px solid #2c3038;border-radius:12px}
+.pager .pg{display:flex;align-items:center;gap:10px}
+.pager .pg a,.pager .pg b{padding:4px 8px;border-radius:8px}
+.pager .pg a{background:#262a31} .pager .pg b{background:#3b6cf0;color:#fff}
+.pager .dis{padding:4px 8px;color:#5a606c}
+.batch.flash-batch{animation:bflash 1.6s ease-out}
+@keyframes bflash{0%{box-shadow:0 0 0 3px #3b6cf0}60%{box-shadow:0 0 0 3px #3b6cf0}100%{box-shadow:0 0 0 3px #3b6cf000}}
 """
 STREAM_JS = """<script>
 async function streamSubmit(form){
@@ -543,7 +822,17 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 <div class=row>
  <div><label>Batch</label><select name=count onchange="document.getElementById('ovsub').textContent='resident worker · ~8s × '+this.value">{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
-</div><button>Generate</button></form>
+ {% if model_choices|length > 1 %}<div><label>Model</label><select name=model>{% for mc in model_choices %}<option value="{{mc}}" {{'selected' if mc==default_model}}>{{mc.replace('flux2-klein-9B-','').replace('flux2-klein-','')}}{{' (stock)' if loop.first}}</option>{% endfor %}</select></div>{% endif %}
+</div>
+<details style="margin-top:6px"><summary class=muted style="cursor:pointer">Advanced · negative / guidance / variation</summary>
+<label>Negative prompt <span class=muted>(only used when guidance &gt; 1)</span></label>
+<textarea name=negative placeholder="blurry, low quality, extra fingers, watermark ..."></textarea>
+<div class=row>
+ <div><label>Guidance <output class=sv id=csv>1.0</output> <span class=muted>1 = off · &gt;2 gets trippy · ~2× slower</span></label><input name=cfg type=range min=1 max=3 step=0.1 value=1 oninput="document.getElementById('csv').value=(+this.value).toFixed(1)"></div>
+ <div><label>Variation <output class=sv id=vsv>0.00</output></label><input name=var_strength type=range min=0 max=1 step=0.05 value=0 oninput="document.getElementById('vsv').value=(+this.value).toFixed(2)"></div>
+ <div><label>Var seed <span class=muted>(blank=random)</span></label><input name=seed_var type=number placeholder=random></div>
+</div></details>
+<button>Generate</button></form>
 
 <h1 style="font-size:15px;margin:24px 0 8px;color:#aab0bd">📷 Remix a photo</h1>
 <form method=post action="{{url_for('upload_remix')}}" enctype=multipart/form-data
@@ -562,6 +851,7 @@ INDEX = """<!doctype html><meta name=viewport content="width=device-width,initia
 <div class=row>
  <div><label>Batch</label><select name=count>{% for c in count_choices %}<option value="{{c}}">{{c}} image{{'s' if c>1}}</option>{% endfor %}</select></div>
  <div><label>Seed <span class=muted>(blank=random)</span></label><input name=seed type=number placeholder=random></div>
+ {% if model_choices|length > 1 %}<div><label>Model</label><select name=model>{% for mc in model_choices %}<option value="{{mc}}" {{'selected' if mc==default_model}}>{{mc.replace('flux2-klein-9B-','').replace('flux2-klein-','')}}{{' (stock)' if loop.first}}</option>{% endfor %}</select></div>{% endif %}
 </div><button>Remix photo</button></form>
 
 {% if cards %}<h1 style="font-size:15px;margin:22px 0 8px;color:#aab0bd">Recent</h1>
@@ -586,7 +876,9 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
   {% if im.ok %}<a class=btn href="{{url_for('remix_form',rid=m.id,idx=loop.index0)}}">Remix</a>
   <a class="btn ip" href="{{url_for('inpaint_form',rid=m.id,idx=loop.index0)}}">Inpaint</a>
   {% if m.res < 2048 %}<form method=post action="{{url_for('upscale',rid=m.id,idx=loop.index0)}}" onsubmit="document.getElementById('ov').style.display='flex'">
-   <button class=up title="Upscale 2×">Upscale</button></form>{% endif %}{% endif %}
+   <button class=up title="Upscale 2×">Upscale</button></form>{% endif %}
+  <form method=post action="{{url_for('outpaint',rid=m.id,idx=loop.index0)}}" onsubmit="document.getElementById('ov').style.display='flex'">
+   <button class=op title="Outpaint (zoom out &amp; fill the border)">Outpaint</button></form>{% endif %}
   <form method=post action="{{url_for('delete',rid=m.id,idx=loop.index0)}}" onsubmit="return confirm('Delete this image?')">
    <button class=del>Delete</button></form>
  </div>
@@ -595,7 +887,7 @@ RESULT = """<!doctype html><meta name=viewport content="width=device-width,initi
 </div>
 <p class=muted>Tap an image to enlarge · tap &amp; hold the large view to save it.</p>
 <div class=meta><b>{{m.prompt}}</b><br>
-<code>res {{m.res}} · {{m.precision}} · {{m.steps}} steps · {{m.count}} image{{'s' if m.count>1}}</code><br>
+<code>res {{m.res}} · {{m.precision}} · {{m.steps}} steps · {{m.count}} image{{'s' if m.count>1}}{% if m.model and m.model != 'flux2-klein-9B' %} · {{m.model.replace('flux2-klein-9B-','')}}{% endif %}</code><br>
 <span class=muted>{{m.when}} · {{m.elapsed}}s total · {{m.mode}}</span>
 </div>
 <div id=lb onclick="this.style.display='none'"><span class=x>&times;</span><img id=lbimg src=""></div>
@@ -687,9 +979,47 @@ GALLERY = """<!doctype html><meta name=viewport content="width=device-width,init
 <title>F2K · gallery</title><style>{{css}}</style><div class=wrap>
 <header><h1><a href="{{url_for('index')}}">← New</a> Gallery</h1><a href="{{url_for('logout')}}">Sign out</a></header>
 {% with msg=get_flashed_messages() %}{% if msg %}<div class=flash>{{msg[0]}}</div>{% endif %}{% endwith %}
-<div class=grid>{% for c in cards %}<a class=card href="{{url_for('result',rid=c.rid)}}">
-<img src="{{url_for('img',fn=c.file)}}"><div class=c>{{c.prompt[:60]}}</div></a>{% endfor %}</div>
-</div>""".replace("{{css}}", BASE_CSS)
+{% macro pager() %}{% if pg.pages > 1 or pg.total > pg.per_page %}<div class=pager>
+ <span class=muted>{{pg.start}}–{{pg.end}} of {{pg.total}}</span>
+ <span class=pg>
+  {% if pg.page > 1 %}<a href="{{url_for('gallery',page=pg.page-1,per=pg.per_page)}}">‹ Prev</a>{% else %}<span class=dis>‹ Prev</span>{% endif %}
+  <span class=muted>page {{pg.page}} / {{pg.pages}}</span>
+  {% if pg.page < pg.pages %}<a href="{{url_for('gallery',page=pg.page+1,per=pg.per_page)}}">Next ›</a>{% else %}<span class=dis>Next ›</span>{% endif %}
+ </span>
+ <span class=pg><span class=muted>per</span>{% for n in per_choices %}{% if n==pg.per_page %}<b>{{n}}</b>{% else %}<a href="{{url_for('gallery',page=1,per=n)}}">{{n}}</a>{% endif %}{% endfor %}</span>
+</div>{% endif %}{% endmacro %}
+{{ pager() }}
+{% for b in batches %}<div class=batch id="b-{{b.rid}}">
+ <div class=bh><a href="{{url_for('result',rid=b.rid)}}">{{ (b.prompt[:70] if b.prompt else 'untitled') }}</a>
+ <span class=muted>{{b.when}} · {{b.count}} img{{'s' if b.count>1}}{% if b.kind %} · {{b.kind}}{% endif %}</span></div>
+ <div class=grid>{% for e in b.images %}<img class=gthumb loading=lazy src="{{url_for('thumb',fn=e.file)}}" onclick="lbOpen({{e.gi}})">{% endfor %}</div>
+</div>{% else %}<p class=muted>No images yet — <a href="{{url_for('index')}}">generate some</a>.</p>{% endfor %}
+{{ pager() }}
+</div>
+<div id=lb onclick="if(event.target.id==='lb')lbClose()"><span class=x onclick="lbClose()">&times;</span>
+<div class=nav id=lbprev onclick="lbStep(-1)">&#8249;</div><img id=lbimg src=""><div class=nav id=lbnext onclick="lbStep(1)">&#8250;</div>
+<div class=cap id=lbcap></div></div>
+<script>
+const IMGS={{flat|tojson}};let lbi=0;
+function esc(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function lbShow(){var m=IMGS[lbi];document.getElementById('lbimg').src='/img/'+encodeURIComponent(m.file);
+ document.getElementById('lbcap').innerHTML='<span class=n>'+(lbi+1)+' / '+IMGS.length+'</span> · '+
+ (m.prompt?esc(m.prompt.slice(0,90))+' · ':'')+'seed '+m.seed+' · <a href="/result/'+m.rid+'">view batch &rarr;</a>';}
+function lbOpen(i){lbi=i;lbShow();document.getElementById('lb').style.display='flex';}
+function lbClose(){document.getElementById('lb').style.display='none';}
+function lbStep(d){lbi=(lbi+d+IMGS.length)%IMGS.length;lbShow();}
+document.addEventListener('keydown',function(e){if(document.getElementById('lb').style.display!=='flex')return;
+ if(e.key==='ArrowLeft')lbStep(-1);else if(e.key==='ArrowRight')lbStep(1);else if(e.key==='Escape')lbClose();});
+(function(){var x0=0,lb=document.getElementById('lb');
+ lb.addEventListener('touchstart',function(e){x0=e.changedTouches[0].clientX;},{passive:true});
+ lb.addEventListener('touchend',function(e){var dx=e.changedTouches[0].clientX-x0;if(Math.abs(dx)>40)lbStep(dx<0?1:-1);},{passive:true});})();
+// After a delete we land on /gallery#b-<rid>: scroll to that batch and flash it.
+(function(){var h=location.hash;if(h.indexOf('#b-')!==0)return;
+ var el=document.getElementById(h.slice(1));if(!el)return;
+ // thumbnails reserve height via aspect-ratio, so layout is stable before load
+ el.scrollIntoView({block:'center'});el.classList.add('flash-batch');
+ setTimeout(function(){el.classList.remove('flash-batch');},1600);})();
+</script>""".replace("{{css}}", BASE_CSS)
 
 if __name__ == "__main__":
     port = int(os.environ.get("F2K_WEB_PORT", "5000"))

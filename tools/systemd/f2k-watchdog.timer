@@ -1,0 +1,13 @@
+[Unit]
+Description=Probe the F2K worker every 2 minutes (wedge detection)
+
+[Timer]
+# First probe well after boot: the worker needs ~12 s to load klein-4B, and there
+# is no point racing it.
+OnBootSec=5min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=f2k-watchdog.service
+
+[Install]
+WantedBy=timers.target

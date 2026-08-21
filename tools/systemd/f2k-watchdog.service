@@ -1,0 +1,21 @@
+[Unit]
+Description=F2K worker watchdog (probe :8765, restart if wedged)
+# Only meaningful while the worker is supposed to be up. The script re-checks
+# this itself and no-ops if the unit is inactive or mid-restart.
+After=f2k-worker.service
+
+[Service]
+Type=oneshot
+# Root: it needs to `systemctl restart f2k-worker`.
+RuntimeDirectory=f2k-watchdog
+RuntimeDirectoryPreserve=yes
+WorkingDirectory=/home/chris/Documents/Development/Cpp/Projects/F2KTest
+ExecStart=/home/chris/Documents/Development/Cpp/Projects/F2KTest/tools/f2k_watchdog.sh
+# A hung probe must never outlive its own timer interval.
+TimeoutStartSec=90
+
+# Tunables (defaults shown in the script):
+#   F2K_WD_FAILS         consecutive bad cycles before restarting   (3)
+#   F2K_WD_PROBE_TIMEOUT seconds to wait for a reply                (20)
+#   F2K_WD_BUSY_PCT      GPU %% that counts as "working, not wedged" (5)
+# Environment=F2K_WD_FAILS=3

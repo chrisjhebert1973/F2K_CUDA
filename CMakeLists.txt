@@ -19,14 +19,24 @@ endif()
 # CUDA is enabled lazily — the scaffold compiles without it. Once the real
 # backend lands, set F2K_ENABLE_CUDA=ON and we light up the CUDA language.
 option(F2K_ENABLE_CUDA "Enable CUDA + CUTLASS code paths" OFF)
+# The Dear ImGui (Vulkan) desktop frontend is optional — the worker + generate +
+# Flask web UI don't need it. Turn OFF on machines without a Vulkan SDK (e.g. the
+# Windows worker build): -DF2K_BUILD_GUI=OFF.
+option(F2K_BUILD_GUI "Build the Dear ImGui (Vulkan) desktop frontend" ON)
 
 if(F2K_ENABLE_CUDA)
     # MUST be set before enable_language(CUDA); otherwise CMake's auto-probe
     # writes some random fallback (Turing 75 in this case) and our default
-    # never wins. 121a = Blackwell GB10 with arch-specific instructions
-    # (tcgen05, block-scaled MMA) which CUTLASS's NVFP4 MMA requires.
-    set(CMAKE_CUDA_ARCHITECTURES "121a" CACHE STRING
-        "CUDA architectures — Blackwell GB10 / DGX Spark" FORCE)
+    # never wins. Arch knob: 121a = Blackwell GB10 / DGX Spark (default),
+    # 120a = RTX 5090 (consumer Blackwell), 89 = Ada / RTX 4080. Override with
+    # -DF2K_CUDA_ARCH=120a. The trailing 'a' (arch-specific) is REQUIRED on
+    # Blackwell — CUTLASS's block-scaled NVFP4/MXFP8 MMA are arch-conditional
+    # instructions that only emit for sm_1NNa; plain sm_1NN compiles but the
+    # kernels abort at runtime ("Arch conditional MMA instruction used without
+    # targeting appropriate compute capability"). CMAKE_CUDA_ARCHITECTURES is
+    # FORCEd from this so the auto-probe can't win.
+    set(F2K_CUDA_ARCH "121a" CACHE STRING "Target CUDA arch: 121a (GB10) / 120a (RTX 5090) / 89 (Ada)")
+    set(CMAKE_CUDA_ARCHITECTURES "${F2K_CUDA_ARCH}" CACHE STRING "" FORCE)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -39,36 +49,39 @@ endif()
 # Dependencies
 # ---------------------------------------------------------------------------
 
-find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 
-# GLFW: build only the library we need.
-set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/glfw EXCLUDE_FROM_ALL)
+if(F2K_BUILD_GUI)
+    find_package(Vulkan REQUIRED)
 
-# ImGui: vendored sources, compiled as a static lib.
-set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
-add_library(imgui STATIC
-    ${IMGUI_DIR}/imgui.cpp
-    ${IMGUI_DIR}/imgui_draw.cpp
-    ${IMGUI_DIR}/imgui_tables.cpp
-    ${IMGUI_DIR}/imgui_widgets.cpp
-    ${IMGUI_DIR}/imgui_demo.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
-)
-target_include_directories(imgui PUBLIC
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-)
-target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
-target_compile_definitions(imgui PUBLIC
-    IMGUI_IMPL_VULKAN_NO_PROTOTYPES=0
-    GLFW_INCLUDE_NONE
-)
+    # GLFW: build only the library we need.
+    set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/glfw EXCLUDE_FROM_ALL)
+
+    # ImGui: vendored sources, compiled as a static lib.
+    set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
+    add_library(imgui STATIC
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp
+        ${IMGUI_DIR}/imgui_demo.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+    )
+    target_include_directories(imgui PUBLIC
+        ${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
+    )
+    target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
+    target_compile_definitions(imgui PUBLIC
+        IMGUI_IMPL_VULKAN_NO_PROTOTYPES=0
+        GLFW_INCLUDE_NONE
+    )
+endif()
 
 # stb: header-only.
 add_library(stb INTERFACE)
@@ -93,6 +106,7 @@ target_include_directories(nlohmann_json INTERFACE
 # ---------------------------------------------------------------------------
 
 add_library(f2k_common STATIC
+    src/common/platform.cpp
     src/common/safetensors.cpp
     src/common/f2k_format.cpp
     src/common/f2k_model_loader.cpp
@@ -109,41 +123,73 @@ target_compile_options(f2k_common PRIVATE
 # F2K executable
 # ---------------------------------------------------------------------------
 
-add_executable(f2k
-    src/main.cpp
-    src/app/app.cpp
-    src/backend/stub_backend.cpp
-)
-target_include_directories(f2k PRIVATE src)
-target_link_libraries(f2k PRIVATE
-    f2k_common
-    imgui
-    glfw
-    Vulkan::Vulkan
-    stb
-    Threads::Threads
-)
-target_compile_options(f2k PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wno-missing-field-initializers>
-)
+if(F2K_BUILD_GUI)
+    add_executable(f2k
+        src/main.cpp
+        src/app/app.cpp
+        src/backend/stub_backend.cpp
+    )
+    target_include_directories(f2k PRIVATE src)
+    target_link_libraries(f2k PRIVATE
+        f2k_common
+        imgui
+        glfw
+        Vulkan::Vulkan
+        stb
+        Threads::Threads
+    )
+    target_compile_options(f2k PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wno-missing-field-initializers>
+    )
+endif()
 
 # When CUDA is enabled, the backend lib will pull in CUTLASS + cuBLAS + cuDNN.
 if(F2K_ENABLE_CUDA)
-    # cuDNN — for the VAE decoder convs and norms. The Blackwell (sm_121)
-    # tensor-core conv engines only exist in cuDNN 9 and are reachable only via
-    # the backend graph API (see conv2d.cu). The unversioned `libcudnn.so` dev
-    # symlink points at the legacy cuDNN 8 (no sm_121 kernels — ~170x slower),
-    # so we link libcudnn.so.9 explicitly. Headers in /usr/include are already
-    # v9 (cudnn_version.h reports CUDNN_MAJOR 9).
-    find_library(CUDNN_LIB NAMES cudnn.so.9 libcudnn.so.9 cudnn
-                 HINTS /usr/lib/aarch64-linux-gnu)
-    if(EXISTS /usr/lib/aarch64-linux-gnu/libcudnn.so.9)
-        set(CUDNN_LIB /usr/lib/aarch64-linux-gnu/libcudnn.so.9)
+    # cuDNN — for the VAE convs and norms, reached via the graph API (conv2d.cu).
+    if(WIN32)
+        # Windows: cudnn.lib import lib (cudnn64_9.dll + sublibs needed on PATH at
+        # runtime). The cuDNN 9 installer nests by CUDA version:
+        #   <root>\lib\<cudaver>\x64\cudnn.lib  and  <root>\include\<cudaver>\cudnn.h
+        # (cudaver e.g. 13.3, 12.9), or a flat lib\x64 + include. Auto-detect and
+        # prefer the highest <cudaver> (so CUDA-13 wins over CUDA-12). Explicit
+        # -DCUDNN_LIB / -DCUDNN_INCLUDE_DIRS always override.
+        if(NOT CUDNN_LIB OR NOT CUDNN_INCLUDE_DIRS)
+            set(_cudnn_root "${CUDNN_ROOT}")
+            if(NOT _cudnn_root)
+                set(_cudnn_root "$ENV{CUDNN_ROOT}")
+            endif()
+            file(GLOB _cudnn_libs "${_cudnn_root}/lib/*/x64/cudnn.lib"
+                                  "${_cudnn_root}/lib/x64/cudnn.lib")
+            file(GLOB _cudnn_incs "${_cudnn_root}/include/*/cudnn.h"
+                                  "${_cudnn_root}/include/cudnn.h")
+            if(_cudnn_libs AND NOT CUDNN_LIB)
+                list(SORT _cudnn_libs)
+                list(GET _cudnn_libs -1 CUDNN_LIB)   # last = highest CUDA-ver dir
+            endif()
+            if(_cudnn_incs AND NOT CUDNN_INCLUDE_DIRS)
+                list(SORT _cudnn_incs)
+                list(GET _cudnn_incs -1 _cudnn_inc)
+                get_filename_component(CUDNN_INCLUDE_DIRS "${_cudnn_inc}" DIRECTORY)
+            endif()
+        endif()
+        if(NOT CUDNN_LIB)
+            message(FATAL_ERROR "cuDNN not found under CUDNN_ROOT='${CUDNN_ROOT}'. "
+                "Pass -DCUDNN_LIB=<...\\cudnn.lib> and -DCUDNN_INCLUDE_DIRS=<dir with cudnn.h>.")
+        endif()
+    else()
+        # Linux: the Blackwell (sm_121) conv engines only exist in cuDNN 9 and the
+        # unversioned `libcudnn.so` dev symlink points at legacy cuDNN 8
+        # (no sm_121 kernels — ~170x slower), so link libcudnn.so.9 explicitly.
+        find_library(CUDNN_LIB NAMES cudnn.so.9 libcudnn.so.9 cudnn
+                     HINTS /usr/lib/aarch64-linux-gnu)
+        if(EXISTS /usr/lib/aarch64-linux-gnu/libcudnn.so.9)
+            set(CUDNN_LIB /usr/lib/aarch64-linux-gnu/libcudnn.so.9)
+        endif()
+        if(NOT CUDNN_LIB)
+            message(FATAL_ERROR "cuDNN not found. Install libcudnn9-cuda-13 + libcudnn9-dev-cuda-13.")
+        endif()
+        set(CUDNN_INCLUDE_DIRS /usr/include /usr/include/aarch64-linux-gnu)
     endif()
-    if(NOT CUDNN_LIB)
-        message(FATAL_ERROR "cuDNN not found. Install libcudnn9-cuda-13 + libcudnn9-dev-cuda-13.")
-    endif()
-    set(CUDNN_INCLUDE_DIRS /usr/include /usr/include/aarch64-linux-gnu)
     message(STATUS "cuDNN: ${CUDNN_LIB}")
 
     add_library(f2k_cuda STATIC
@@ -189,7 +235,9 @@ if(F2K_ENABLE_CUDA)
         POSITION_INDEPENDENT_CODE ON
         CUDA_SEPARABLE_COMPILATION ON
     )
-    target_link_libraries(f2k PRIVATE f2k_cuda)
+    if(F2K_BUILD_GUI)
+        target_link_libraries(f2k PRIVATE f2k_cuda)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -304,6 +352,15 @@ if(F2K_ENABLE_CUDA)
 
     add_executable(serve tools/serve.cu)
     target_link_libraries(serve PRIVATE f2k_cuda f2k_common stb nlohmann_json)
+    if(WIN32)
+        target_link_libraries(serve PRIVATE ws2_32)   # Winsock
+    endif()
+
+    # LAN bridge for retro clients (e.g. the SGI Octane ViewKit app). Pure host
+    # C++ — no CUDA — it just forwards jobs to the loopback worker and hands back
+    # decoded RGB. See tools/octane/ for the Octane side.
+    add_executable(octane_bridge tools/octane_bridge.cpp)
+    target_link_libraries(octane_bridge PRIVATE stb nlohmann_json)
 
     add_executable(bench_attention tools/bench_attention.cu)
     target_link_libraries(bench_attention PRIVATE f2k_cuda)

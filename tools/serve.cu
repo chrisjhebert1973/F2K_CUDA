@@ -4,13 +4,19 @@
 // with a newline-delimited JSON protocol, so each image costs only the ~8s of
 // real work instead of the ~16s model load. Qwen3 + tokenizer are resolution-
 // independent and stay resident forever; the transformer + VAE (which depend on
-// res/precision) are cached and rebuilt only when those change (~6s, since Qwen
-// is not reloaded).
+// res/precision/transformer) are cached and rebuilt only when those change
+// (~6s, since Qwen is not reloaded).
 //
-//   build/serve [--port 8765]
+//   build/serve [--port 8765] [--transformer <shard-dir>]
 //
 // Request  (one JSON line): {"prompt":"...","res":1024,"precision":"fp8",
-//                            "steps":4,"seed":777,"out":"/abs/path.png"}
+//                            "steps":4,"seed":777,"out":"/abs/path.png",
+//                            "model":"/abs/model-root",        // optional; ""=stock 9B
+//                            "transformer":"/abs/shard-dir"}   // optional override
+// "model" is a model root (f2k_model.json + transformer_*/qwen3_f2k/vae_f2k/
+// tokenizer), e.g. ~/models/flux2-klein-4B — its encoder is cached resident per
+// root. "transformer" overrides just the MMDiT shard dir within that root's
+// architecture (e.g. a klein-9B finetune via bfl_to_diffusers.py + f2k_convert).
 // Response (one JSON line): {"ok":true,"elapsed":8.1,"timing":["...", ...]}
 //                       or  {"ok":false,"error":"..."}
 
@@ -23,6 +29,7 @@
 #include "common/bpe_tokenizer.h"
 #include "common/f2k_format.h"
 #include "common/f2k_model_loader.h"
+#include "common/model_manifest.h"
 #include "common/tensor_router.h"
 
 #include <cuda_bf16.h>
@@ -33,15 +40,54 @@
 #include "stb_image_write.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#define STBIR_NO_SIMD          // arm_neon.h intrinsics don't compile under nvcc
-#include "stb_image_resize2.h"
+// (stb_image_resize2 intentionally NOT used — its SIMD intrinsics don't compile
+//  cleanly under nvcc on either ARM (arm_neon.h) or MSVC; resize_bilinear below
+//  replaces it for the preview downscale + init-image fit.)
 
-#include <arpa/inet.h>
-#include <csignal>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+// --- cross-platform TCP sockets (POSIX BSD sockets | Windows Winsock2) ------
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX               // don't clobber std::min/std::max with macros
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+  using sock_t = SOCKET;
+  static inline void net_startup(){ WSADATA w; WSAStartup(MAKEWORD(2,2), &w); }
+  static inline void sock_close(sock_t s){ closesocket(s); }
+  static inline bool sock_valid(sock_t s){ return s != INVALID_SOCKET; }
+  static inline int  sock_recv(sock_t s, void* b, int n){ return recv(s,(char*)b,n,0); }
+  static inline int  sock_send(sock_t s, const void* b, size_t n){ return send(s,(const char*)b,(int)n,0); }
+  static inline void ignore_sigpipe(){}                 // Windows raises no SIGPIPE
+  static inline bool sock_timed_out(){ return WSAGetLastError() == WSAETIMEDOUT; }
+  static inline void set_io_timeouts(sock_t s, int sec){
+      DWORD ms = (DWORD)sec * 1000;                     // Winsock wants milliseconds
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof ms);
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof ms);
+  }
+#else
+  #include <arpa/inet.h>
+  #include <cerrno>
+  #include <csignal>
+  #include <netinet/in.h>
+  #include <sys/socket.h>
+  #include <sys/time.h>
+  #include <unistd.h>
+  using sock_t = int;
+  static inline void net_startup(){}
+  static inline void sock_close(sock_t s){ ::close(s); }
+  static inline bool sock_valid(sock_t s){ return s >= 0; }
+  static inline int  sock_recv(sock_t s, void* b, int n){ return (int)::read(s,b,(size_t)n); }
+  static inline int  sock_send(sock_t s, const void* b, size_t n){ return (int)::write(s,b,n); }
+  static inline void ignore_sigpipe(){ std::signal(SIGPIPE, SIG_IGN); }
+  static inline bool sock_timed_out(){ return errno == EAGAIN || errno == EWOULDBLOCK; }
+  // SO_RCVTIMEO/SO_SNDTIMEO govern ::read/::write on a socket just as they do
+  // recv/send, so the shim above stays as-is.
+  static inline void set_io_timeouts(sock_t s, int sec){
+      timeval tv{}; tv.tv_sec = sec; tv.tv_usec = 0;
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+  }
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -49,11 +95,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
@@ -61,10 +111,25 @@ static inline __nv_bfloat16 f2b(float v) { return __float2bfloat16(v); }
 static inline float         b2f(__nv_bfloat16 v) { return __bfloat162float(v); }
 static double since(Clock::time_point t){ return std::chrono::duration<double>(Clock::now()-t).count(); }
 
+// Classifier-free guidance combine (per element): out = uncond + cfg*(cond - uncond).
+// out may alias cond (each thread touches only its own index).
+__global__ void cfg_combine_bf16(__nv_bfloat16* out, const __nv_bfloat16* cond,
+                                 const __nv_bfloat16* uncond, float cfg, int n){
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if(i < n){
+        float c = __bfloat162float(cond[i]);
+        float u = __bfloat162float(uncond[i]);
+        out[i] = __float2bfloat16(u + cfg*(c - u));
+    }
+}
+
 namespace {
 constexpr int PATCH=2, SEQ_TXT=512, IN_CH=128, T5_DIM=12288, TIME_DIM=256;
 constexpr int N_HEADS=32, HEAD_DIM=128, FFN_DIM=12288, N_DOUBLE=8, N_SINGLE=24;
-const char* HOME = std::getenv("HOME");
+const std::string HOME_DIR = f2k::platform::home_dir();   // $HOME | %USERPROFILE%
+const char* HOME = HOME_DIR.c_str();
+std::string g_tf_default;     // --transformer <dir>: default shard dir override
+std::string g_model_default;  // --model <root>: default model root override
 
 bool write_png(const std::string& path, const float* rgb_chw, int H, int W){
     std::vector<uint8_t> b((size_t)H*W*3);
@@ -92,6 +157,26 @@ void png_collect(void* ctx, void* data, int size){
     auto* p=static_cast<uint8_t*>(data); v->insert(v->end(), p, p+size);
 }
 
+// Bilinear resize for 8-bit interleaved images (ch channels). Good enough for a
+// preview downscale and an init-image fit; replaces stb_image_resize2.
+void resize_bilinear(const uint8_t* src, int sw, int sh,
+                     uint8_t* dst, int dw, int dh, int ch){
+    for(int y=0;y<dh;++y){
+        const float fy=(dh>1)?(float)y*(sh-1)/(dh-1):0.f;
+        const int y0=(int)fy, y1=std::min(y0+1,sh-1); const float wy=fy-y0;
+        for(int x=0;x<dw;++x){
+            const float fx=(dw>1)?(float)x*(sw-1)/(dw-1):0.f;
+            const int x0=(int)fx, x1=std::min(x0+1,sw-1); const float wx=fx-x0;
+            for(int c=0;c<ch;++c){
+                const float a=src[((size_t)y0*sw+x0)*ch+c], b=src[((size_t)y0*sw+x1)*ch+c];
+                const float d=src[((size_t)y1*sw+x0)*ch+c], e=src[((size_t)y1*sw+x1)*ch+c];
+                const float top=a+(b-a)*wx, bot=d+(e-d)*wx;
+                dst[((size_t)y*dw+x)*ch+c]=(uint8_t)(top+(bot-top)*wy+0.5f);
+            }
+        }
+    }
+}
+
 // Load an image, resize to res×res, return BF16 [3,res,res] in model space
 // [-1,1] (the inverse of write_png's (v+1)/2 encode). Errors → false.
 bool load_image_bf16(const std::string& path, int res,
@@ -103,8 +188,7 @@ bool load_image_bf16(const std::string& path, int res,
     const uint8_t* src=px;
     if(w!=res || h!=res){
         rgb.resize((size_t)res*res*3);
-        if(!stbir_resize_uint8_linear(px,w,h,0, rgb.data(),res,res,0, STBIR_RGB)){
-            stbi_image_free(px); err="resize failed"; return false; }
+        resize_bilinear(px,w,h, rgb.data(),res,res, 3);
         src=rgb.data();
     }
     out.resize((size_t)3*res*res);
@@ -128,8 +212,7 @@ bool load_mask_tokens(const std::string& path, int res, int H_P, int W_P,
     std::vector<uint8_t> g;
     const uint8_t* src=px;
     if(w!=res || h!=res){ g.resize((size_t)res*res);
-        if(!stbir_resize_uint8_linear(px,w,h,0, g.data(),res,res,0, STBIR_1CHANNEL)){
-            stbi_image_free(px); err="mask resize failed"; return false; }
+        resize_bilinear(px,w,h, g.data(),res,res, 1);
         src=g.data(); }
     const int bh=res/H_P, bw=res/W_P;
     m.assign((size_t)H_P*W_P, 0.f);
@@ -146,6 +229,8 @@ bool load_mask_tokens(const std::string& path, int res, int H_P, int W_P,
 // Resolution/precision-dependent resident pipeline (transformer + VAE + buffers).
 struct Pipeline {
     int res=0; std::string precision;
+    std::string tf_dir;       // transformer shard dir override ("" = by precision)
+    std::string model_root;   // model root (encoder/VAE/manifest source)
     std::unique_ptr<f2k::F2KModelLoader> ld;
     std::unique_ptr<f2k::TensorRouter> router;
     std::unique_ptr<f2k::cuda::FluxTransformer> model;
@@ -155,69 +240,119 @@ struct Pipeline {
     int H_LAT=0,W_LAT=0,SEQ_IMG=0,H_P=0,W_P=0;
     size_t latent_elems=0, token_elems=0, pixel_elems=0, moment_elems=0;
     void *d_latent=nullptr,*d_tokens=nullptr,*d_velocity=nullptr,*d_pixels=nullptr;
+    void *d_velocity_neg=nullptr;   // CFG: unconditional velocity
     void *d_t_ws=nullptr,*d_v_ws=nullptr;
     void *d_init_pix=nullptr,*d_moments=nullptr,*d_e_ws=nullptr;   // encoder I/O + ws
     std::vector<float> bn_mean, bn_std;   // [IN_CH]
 
-    ~Pipeline(){ for(void* p:{d_latent,d_tokens,d_velocity,d_pixels,d_t_ws,d_v_ws,
+    ~Pipeline(){ for(void* p:{d_latent,d_tokens,d_velocity,d_velocity_neg,d_pixels,d_t_ws,d_v_ws,
                               d_init_pix,d_moments,d_e_ws}) if(p) cudaFree(p); }
+};
+
+// Per-model-root encoder bundle: Qwen3 + tokenizer + conditioning buffers.
+// Cached forever once built (a few GB each; the Spark has room for all of them).
+struct Encoder {
+    f2k::ModelManifest mf;
+    std::unique_ptr<f2k::F2KModelLoader> ld;
+    std::unique_ptr<f2k::cuda::QwenEncoder> qwen;
+    f2k::BpeTokenizer tok;
+    void *d_txt=nullptr,*d_txt_neg=nullptr,*d_ws=nullptr; int32_t* d_ids=nullptr;
+    ~Encoder(){ for(void* p:{d_txt,d_txt_neg,d_ws,(void*)d_ids}) if(p) cudaFree(p); }
 };
 
 // Resident, resolution-independent state.
 struct Worker {
-    std::unique_ptr<f2k::F2KModelLoader> qwen_ld;
-    std::unique_ptr<f2k::cuda::QwenEncoder> qwen;
-    f2k::BpeTokenizer tok;
-    void *d_txt=nullptr,*d_temb=nullptr; int32_t* d_ids=nullptr; void* d_q_ws=nullptr;
-    std::unique_ptr<Pipeline> pipe;   // current cached (res,precision)
+    std::map<std::string,std::unique_ptr<Encoder>> encoders;  // key: model root path
+    void *d_temb=nullptr;
+    std::unique_ptr<Pipeline> pipe;   // current cached (res,precision,tf,model)
+
+    static std::string stock_root(){ return (fs::path(HOME)/"models/flux2-klein-9B").string(); }
+
+    Encoder* ensure_encoder(const std::string& root, std::string& err){
+        // Character checkpoints symlink qwen3_f2k from their base model's root;
+        // key the cache on the canonical path so they share one resident encoder.
+        std::error_code ec;
+        const fs::path canon=fs::weakly_canonical(fs::path(root)/"qwen3_f2k",ec);
+        const std::string key=ec?root:canon.string();
+        auto it=encoders.find(key);
+        if(it!=encoders.end()) return it->second.get();
+        auto e=std::make_unique<Encoder>();
+        if(!e->mf.load(root,&err)) return nullptr;
+        std::vector<fs::path> shards;
+        const fs::path q_dir=fs::path(root)/"qwen3_f2k";
+        if(fs::is_directory(q_dir))
+            for(const auto& d:fs::directory_iterator(q_dir))
+                if(d.path().extension()==".f2k1") shards.push_back(d.path());
+        std::sort(shards.begin(),shards.end());
+        if(shards.empty()){ err="no qwen shards in "+q_dir.string(); return nullptr; }
+        e->ld=std::make_unique<f2k::F2KModelLoader>();
+        for(const auto& s:shards)
+            if(!e->ld->add_shard(s.string())){ err="qwen loader: "+e->ld->last_error(); return nullptr; }
+        f2k::cuda::QwenEncoder::Config qc{}; qc.seq=SEQ_TXT; qc.loader=e->ld.get();
+        qc.hidden=e->mf.q_hidden; qc.n_heads=e->mf.q_heads; qc.n_kv_heads=e->mf.q_kv_heads;
+        qc.head_dim=e->mf.q_head_dim; qc.ffn_dim=e->mf.q_ffn; qc.n_layers=e->mf.q_layers;
+        qc.vocab_size=e->mf.q_vocab; qc.rope_theta=e->mf.q_rope_theta;
+        qc.capture_layers=e->mf.capture_layers;
+        auto t=Clock::now(); e->qwen=std::make_unique<f2k::cuda::QwenEncoder>(qc);
+        if(!e->qwen->ok()){ err=std::string("qwen ctor: ")+e->qwen->last_error(); return nullptr; }
+        if(!e->tok.load((fs::path(root)/"tokenizer").string())){
+            err="tokenizer: "+e->tok.error(); return nullptr; }
+        cudaMalloc(&e->d_txt,(size_t)SEQ_TXT*e->mf.t5_dim*2);
+        cudaMalloc(&e->d_txt_neg,(size_t)SEQ_TXT*e->mf.t5_dim*2);   // CFG unconditional
+        cudaMalloc(&e->d_ids,SEQ_TXT*sizeof(int32_t));
+        cudaMalloc(&e->d_ws,e->qwen->workspace_size_bytes());
+        std::fprintf(stderr,"[worker] encoder %s ready in %.1fs\n",root.c_str(),since(t));
+        return (encoders[key]=std::move(e)).get();
+    }
 
     bool init(std::string& err){
-        // Qwen3 encoder (4 shards) — load once, keep forever.
-        qwen_ld=std::make_unique<f2k::F2KModelLoader>();
-        for(int i=1;i<=4;++i){ char p[256];
-            std::snprintf(p,sizeof(p),"%s/models/flux2-klein-9B/qwen3_f2k/shard-%05d.f2k1",HOME,i);
-            if(!qwen_ld->add_shard(p)){ err="qwen loader: "+qwen_ld->last_error(); return false; } }
-        f2k::cuda::QwenEncoder::Config qc{}; qc.seq=SEQ_TXT; qc.loader=qwen_ld.get();
-        qc.capture_layers={8,17,26};
-        auto t=Clock::now(); qwen=std::make_unique<f2k::cuda::QwenEncoder>(qc);
-        if(!qwen->ok()){ err=std::string("qwen ctor: ")+qwen->last_error(); return false; }
-        std::fprintf(stderr,"[worker] Qwen3 ready in %.1fs\n",since(t));
-        if(!tok.load(std::string(HOME)+"/models/flux2-klein-9B/tokenizer")){
-            err="tokenizer: "+tok.error(); return false; }
-        cudaMalloc(&d_txt, (size_t)SEQ_TXT*T5_DIM*2);
-        cudaMalloc(&d_temb, TIME_DIM*2);
-        cudaMalloc(&d_ids, SEQ_TXT*sizeof(int32_t));
-        cudaMalloc(&d_q_ws, qwen->workspace_size_bytes());
+        // Stock encoder — load at startup, keep forever (same behavior as before).
+        if(!ensure_encoder(g_model_default.empty()?stock_root():g_model_default,err)) return false;
+        cudaMalloc(&d_temb,TIME_DIM*2);
         return true;
     }
 
-    // Build (or rebuild) the transformer+VAE pipeline for (res, precision).
-    bool ensure(int res, const std::string& precision, std::string& err){
-        if(pipe && pipe->res==res && pipe->precision==precision) return true;
+    // Build (or rebuild) the transformer+VAE pipeline for
+    // (res, precision, tf_dir, model_root).
+    // tf_dir: shard directory override ("" = model_root dir chosen by precision).
+    bool ensure(int res, const std::string& precision, const std::string& tf_dir,
+                const std::string& model_root, const f2k::ModelManifest& mf,
+                std::string& err){
+        if(pipe && pipe->res==res && pipe->precision==precision && pipe->tf_dir==tf_dir
+               && pipe->model_root==model_root)
+            return true;
         pipe.reset();   // free old GPU memory first
         auto p=std::make_unique<Pipeline>();
-        p->res=res; p->precision=precision;
+        p->res=res; p->precision=precision; p->tf_dir=tf_dir; p->model_root=model_root;
         p->H_LAT=res/8; p->W_LAT=res/8; p->H_P=p->H_LAT/PATCH; p->W_P=p->W_LAT/PATCH;
         p->SEQ_IMG=p->H_P*p->W_P;
         if(res%16!=0 || p->SEQ_IMG%128!=0){ err="bad res "+std::to_string(res); return false; }
         const bool fp8=(precision=="fp8");
         const char* dir=fp8?"transformer_mxfp8":"transformer_f2k";
+        const fs::path tf_path = tf_dir.empty()
+            ? fs::path(model_root)/dir
+            : fs::path(tf_dir);
+        std::vector<fs::path> shards;
+        if(fs::is_directory(tf_path))
+            for(const auto& e:fs::directory_iterator(tf_path))
+                if(e.path().extension()==".f2k1") shards.push_back(e.path());
+        std::sort(shards.begin(),shards.end());
+        if(shards.empty()){ err="no .f2k1 shards in: "+tf_path.string(); return false; }
         p->ld=std::make_unique<f2k::F2KModelLoader>();
-        for(int i=1;i<=2;++i){ char s[256];
-            std::snprintf(s,sizeof(s),"%s/models/flux2-klein-9B/%s/shard-%05d.f2k1",HOME,dir,i);
-            if(!p->ld->add_shard(s)){ err="tf loader: "+p->ld->last_error(); return false; } }
+        for(const auto& s:shards)
+            if(!p->ld->add_shard(s.string())){ err="tf loader: "+p->ld->last_error(); return false; }
         p->router=std::make_unique<f2k::TensorRouter>(*p->ld);
         if(!p->router->build()){ err="router: "+p->router->last_error(); return false; }
         f2k::cuda::FluxTransformer::Config tc{};
         tc.batch=1; tc.seq_img=p->SEQ_IMG; tc.seq_txt=SEQ_TXT; tc.H_patches=p->H_P; tc.W_patches=p->W_P;
-        tc.in_channels=IN_CH; tc.t5_dim=T5_DIM; tc.time_dim=TIME_DIM; tc.n_heads=N_HEADS;
-        tc.head_dim=HEAD_DIM; tc.ffn_dim=FFN_DIM; tc.num_double_blocks=N_DOUBLE;
-        tc.num_single_blocks=N_SINGLE; tc.rope_theta=2000.0f; tc.router=p->router.get();
+        tc.in_channels=IN_CH; tc.t5_dim=mf.t5_dim; tc.time_dim=mf.time_dim; tc.n_heads=mf.n_heads;
+        tc.head_dim=mf.head_dim; tc.ffn_dim=mf.ffn_dim; tc.num_double_blocks=mf.n_double;
+        tc.num_single_blocks=mf.n_single; tc.rope_theta=mf.rope_theta; tc.router=p->router.get();
         tc.precision = fp8 ? f2k::cuda::Precision::MXFP8 : f2k::cuda::Precision::NVFP4;
         auto t=Clock::now(); p->model=std::make_unique<f2k::cuda::FluxTransformer>(tc);
         if(!p->model->ok()){ err=std::string("transformer: ")+p->model->last_error(); return false; }
         p->vae_r=std::make_unique<f2k::F2KReader>();
-        std::string vp=std::string(HOME)+"/models/flux2-klein-9B/vae_f2k/vae.f2k1";
+        std::string vp=(fs::path(model_root)/"vae_f2k/vae.f2k1").string();
         if(!p->vae_r->open(vp)){ err="open vae"; return false; }
         f2k::cuda::VAEDecoder::Config vc{}; vc.N=1; vc.H_lat=p->H_LAT; vc.W_lat=p->W_LAT;
         vc.prefix="decoder"; vc.reader=p->vae_r.get();
@@ -243,12 +378,14 @@ struct Worker {
         p->moment_elems=(size_t)64*p->H_LAT*p->W_LAT;
         cudaMalloc(&p->d_latent,p->latent_elems*2); cudaMalloc(&p->d_tokens,p->token_elems*2);
         cudaMalloc(&p->d_velocity,p->token_elems*2); cudaMalloc(&p->d_pixels,p->pixel_elems*2);
+        cudaMalloc(&p->d_velocity_neg,p->token_elems*2);   // CFG unconditional velocity
         cudaMalloc(&p->d_t_ws,p->model->workspace_size_bytes());
         cudaMalloc(&p->d_v_ws,p->vae->workspace_size_bytes());
         cudaMalloc(&p->d_init_pix,(size_t)3*res*res*2);
         cudaMalloc(&p->d_moments,p->moment_elems*2);
         cudaMalloc(&p->d_e_ws,p->venc->workspace_size_bytes());
-        std::fprintf(stderr,"[worker] pipeline %dpx/%s built in %.1fs\n",res,precision.c_str(),since(t));
+        std::fprintf(stderr,"[worker] pipeline %dpx/%s%s%s built in %.1fs\n",res,precision.c_str(),
+                     tf_dir.empty()?"":" tf=",tf_dir.empty()?"":tf_dir.c_str(),since(t));
         pipe=std::move(p); return true;
     }
 
@@ -274,10 +411,10 @@ struct Worker {
         int tw=W, th=H;
         if(std::max(W,H)>maxdim){ float s=(float)maxdim/std::max(W,H);
             tw=std::max(1,(int)(W*s)); th=std::max(1,(int)(H*s)); }
-        std::vector<uint8_t> small;
+        std::vector<uint8_t> resized;   // (not 'small' — windows.h #defines small=char)
         const uint8_t* src=rgb.data();
-        if(tw!=W||th!=H){ small.resize((size_t)tw*th*3);
-            stbir_resize_uint8_linear(rgb.data(),W,H,0,small.data(),tw,th,0,STBIR_RGB); src=small.data(); }
+        if(tw!=W||th!=H){ resized.resize((size_t)tw*th*3);
+            resize_bilinear(rgb.data(),W,H, resized.data(),tw,th, 3); src=resized.data(); }
         std::vector<uint8_t> jpg; jpg.reserve((size_t)tw*th);
         stbi_write_jpg_to_func(png_collect,&jpg,tw,th,3,src,82);   // JPEG: ~10× smaller than PNG
         ow=tw; oh=th;
@@ -291,26 +428,58 @@ struct Worker {
         std::string out=req.value("out","");
         std::string init_image=req.value("init_image","");   // img2img source (abs path)
         std::string mask_image=req.value("mask_image","");    // inpaint mask (abs path)
+        std::string transformer=req.value("transformer",g_tf_default);   // shard dir override
         float strength=req.value("strength",0.6f);           // 0..1; only used w/ init_image
+        std::string negative=req.value("negative","");       // CFG unconditional prompt
+        float cfg=req.value("cfg",1.0f);                     // guidance scale; 1.0 = off
+        uint32_t seed_var=(uint32_t)req.value("seed_var",(int64_t)0);
+        float var_strength=req.value("var_strength",0.0f);   // 0..1 blend toward seed_var
         std::vector<std::string> timing; std::string err;
         auto t_all=Clock::now();
+        cfg=std::max(0.0f,std::min(10.0f,cfg));
+        var_strength=std::max(0.0f,std::min(1.0f,var_strength));
+        const bool use_cfg=std::fabs(cfg-1.0f)>1e-3f;
+        // Progress: when a client asks to stream WITHOUT previews (preview:false,
+        // e.g. the Octane bridge), emit a cheap per-phase event with no VAE work.
+        // The web UI streams with preview defaulting true, so it never sees these.
+        const bool stream=req.value("stream",false);
+        const bool preview=req.value("preview",true);
+        auto prog=[&](const char* phase,int step,int total){
+            if(stream && !preview && emit)
+                emit(json{{"event","progress"},{"phase",phase},{"step",step},{"total",total}});
+        };
         if(precision!="fp8"&&precision!="nvfp4") precision="fp8";
         steps=std::max(1,std::min(30,steps));
         strength=std::max(0.05f,std::min(1.0f,strength));
         const bool img2img=!init_image.empty();
         const bool inpaint=img2img && !mask_image.empty();
         if(inpaint) strength=std::max(strength,0.6f);   // need enough steps to fill the region
-        if(!ensure(res,precision,err)) return json{{"ok",false},{"error",err}};
+        std::string model_root=req.value("model",g_model_default);
+        if(model_root.empty()) model_root=stock_root();
+        prog("loading",0,0);
+        Encoder* E=ensure_encoder(model_root,err);
+        if(!E) return json{{"ok",false},{"error",err}};
+        if(!ensure(res,precision,transformer,model_root,E->mf,err))
+            return json{{"ok",false},{"error",err}};
         Pipeline& P=*pipe;
 
         // text encode (native tokenizer → Qwen3)
+        prog("encoding",0,0);
         auto te=Clock::now();
-        std::vector<int32_t> ids=tok.encode_for_flux(prompt,SEQ_TXT);
-        cudaMemcpy(d_ids,ids.data(),SEQ_TXT*sizeof(int32_t),cudaMemcpyHostToDevice);
-        if(!qwen->forward(d_ids,d_txt,d_q_ws,qwen->workspace_size_bytes()))
-            return json{{"ok",false},{"error",std::string("qwen: ")+qwen->last_error()}};
+        std::vector<int32_t> ids=E->tok.encode_for_flux(prompt,SEQ_TXT);
+        cudaMemcpy(E->d_ids,ids.data(),SEQ_TXT*sizeof(int32_t),cudaMemcpyHostToDevice);
+        if(!E->qwen->forward(E->d_ids,E->d_txt,E->d_ws,E->qwen->workspace_size_bytes()))
+            return json{{"ok",false},{"error",std::string("qwen: ")+E->qwen->last_error()}};
         cudaDeviceSynchronize();
-        timing.push_back("text encode "+std::to_string((int)(since(te)*1000))+"ms");
+        if(use_cfg){
+            // Encode the unconditional (negative) prompt into d_txt_neg for CFG.
+            std::vector<int32_t> nids=E->tok.encode_for_flux(negative,SEQ_TXT);
+            cudaMemcpy(E->d_ids,nids.data(),SEQ_TXT*sizeof(int32_t),cudaMemcpyHostToDevice);
+            if(!E->qwen->forward(E->d_ids,E->d_txt_neg,E->d_ws,E->qwen->workspace_size_bytes()))
+                return json{{"ok",false},{"error",std::string("qwen(neg): ")+E->qwen->last_error()}};
+            cudaDeviceSynchronize();
+        }
+        timing.push_back("text encode "+std::to_string((int)(since(te)*1000))+"ms"+(use_cfg?" +neg":""));
 
         // schedule; for img2img we start partway down it (less noise).
         auto sched=f2k::cuda::FlowMatchScheduler::flux2_dynamic(steps,P.SEQ_IMG);
@@ -324,8 +493,15 @@ struct Worker {
         std::mt19937 rng(seed); std::normal_distribution<float> dn(0,1);
         std::vector<float> x0v, eps_host, mask;   // inpaint state (transformer space)
         if(!img2img){
-            // text-to-image: pure N(0,1) latent → patchify
+            // text-to-image: pure N(0,1) latent → patchify. With var_strength>0,
+            // spherically blend toward a second seed's noise (variance-preserving)
+            // so you get "a nearby variation of this seed".
             std::vector<__nv_bfloat16> hl(P.latent_elems);
+            if(var_strength>0.f){
+                std::mt19937 rng2(seed_var); std::normal_distribution<float> dn2(0,1);
+                const float a=var_strength*1.57079633f, ca=std::cos(a), sa=std::sin(a);
+                for(size_t i=0;i<P.latent_elems;++i) hl[i]=f2b(ca*dn(rng)+sa*dn2(rng2));
+            } else
             for(auto& v:hl) v=f2b(dn(rng));
             cudaMemcpy(P.d_latent,hl.data(),P.latent_elems*2,cudaMemcpyHostToDevice);
             if(!f2k::cuda::patchify_bf16(P.d_latent,P.d_tokens,1,32,P.H_LAT,P.W_LAT,PATCH))
@@ -363,7 +539,6 @@ struct Worker {
 
         // denoise
         auto dl=Clock::now();
-        const bool stream=req.value("stream",false);
         const int n_run=steps-i_start;
         const int prev_every=std::max(1,n_run/4);
         std::vector<__nv_bfloat16> cur;   // inpaint host scratch
@@ -383,16 +558,27 @@ struct Worker {
             }
             auto ht=f2k::cuda::compute_timestep_embedding(sched.t(i)*1000.0f,TIME_DIM);
             cudaMemcpy(d_temb,ht.data(),TIME_DIM*2,cudaMemcpyHostToDevice);
-            if(!P.model->forward(P.d_tokens,d_txt,d_temb,P.d_velocity,P.d_t_ws,P.model->workspace_size_bytes()))
+            if(!P.model->forward(P.d_tokens,E->d_txt,d_temb,P.d_velocity,P.d_t_ws,P.model->workspace_size_bytes()))
                 return json{{"ok",false},{"error",std::string("step: ")+P.model->last_error()}};
+            if(use_cfg){
+                // second (unconditional) forward, then v = v_neg + cfg*(v_cond - v_neg)
+                if(!P.model->forward(P.d_tokens,E->d_txt_neg,d_temb,P.d_velocity_neg,P.d_t_ws,P.model->workspace_size_bytes()))
+                    return json{{"ok",false},{"error",std::string("step(neg): ")+P.model->last_error()}};
+                const int n=(int)P.token_elems, TPB=256, NB=(n+TPB-1)/TPB;
+                cfg_combine_bf16<<<NB,TPB>>>((__nv_bfloat16*)P.d_velocity,
+                    (const __nv_bfloat16*)P.d_velocity,(const __nv_bfloat16*)P.d_velocity_neg,cfg,n);
+            }
             if(!f2k::cuda::axpy_bf16(P.d_tokens,P.d_velocity,sched.dt(i),P.token_elems))
                 return json{{"ok",false},{"error","axpy"}};
             if(stream && emit){
                 int k=i-i_start;
-                if((k+1)%prev_every==0 || k==n_run-1){
+                bool want_prev = preview && ((k+1)%prev_every==0 || k==n_run-1);
+                if(want_prev){
                     int ow=0,oh=0; std::string b=preview_b64(P,384,ow,oh);
                     if(!b.empty()) emit(json{{"event","progress"},{"step",k+1},{"total",n_run},
                                             {"w",ow},{"h",oh},{"img_b64",b}});
+                } else if(!preview){   // cheap per-step progress (no VAE preview)
+                    emit(json{{"event","progress"},{"phase","denoise"},{"step",k+1},{"total",n_run}});
                 }
             }
         }
@@ -418,6 +604,7 @@ struct Worker {
             return json{{"ok",false},{"error","unpatchify"}};
 
         // VAE decode
+        prog("decoding",0,0);
         auto vd=Clock::now();
         if(!P.vae->forward(P.d_latent,P.d_pixels,P.d_v_ws,P.vae->workspace_size_bytes()))
             return json{{"ok",false},{"error",std::string("vae: ")+P.vae->last_error()}};
@@ -435,39 +622,116 @@ struct Worker {
     }
 };
 
-// read one '\n'-terminated line from fd
-bool read_line(int fd, std::string& line){
+// read one '\n'-terminated line from fd.
+//
+// This loop is the whole server: it is single-threaded and strictly serial, so
+// whatever blocks here blocks *every* client. Without a recv timeout a peer that
+// connects and then goes silent — an iPad dropping off Tailscale mid-request is
+// the classic — parks the accept loop forever. The process stays alive and the
+// port stays bound, so systemd's Restart=always cannot see it and `is-active`
+// reports "active" while every request times out. set_io_timeouts() on the
+// accepted socket turns that into an EAGAIN we can walk away from.
+//
+// The timeout is per-recv and therefore idle-only: any byte arriving resets it,
+// so a slow-but-live client is never cut off. Requests are one short JSON line
+// (both front-ends pass images as file paths, not inline data), so a stall this
+// long means the peer has genuinely stopped talking.
+enum class LineStatus { Ok, Closed, TimedOut };
+
+LineStatus read_line(sock_t fd, std::string& line){
     line.clear(); char c;
-    while(true){ ssize_t n=read(fd,&c,1); if(n<=0) return !line.empty(); if(c=='\n') return true; line+=c; }
+    while(true){
+        int n=sock_recv(fd,&c,1);
+        if(n<=0){
+            if(n<0 && sock_timed_out()) return LineStatus::TimedOut;
+            // n==0 is a clean half-close. Keep the historical behaviour of
+            // honouring a request terminated by EOF instead of '\n'.
+            return line.empty() ? LineStatus::Closed : LineStatus::Ok;
+        }
+        if(c=='\n') return LineStatus::Ok;
+        line+=c;
+    }
+}
+
+// send() may write fewer bytes than asked (notably on Winsock); a short write
+// mid-JSON-line leaves the client waiting forever for the '\n'. Loop until done.
+bool send_all(sock_t fd, const void* buf, size_t n){
+    const char* p=static_cast<const char*>(buf);
+    while(n){ int k=sock_send(fd,p,n); if(k<=0) return false; p+=k; n-=(size_t)k; }
+    return true;
 }
 } // namespace
 
 int main(int argc,char**argv){
-    std::signal(SIGPIPE, SIG_IGN);   // a client disconnecting mid-stream must not kill us
+    net_startup();                   // WSAStartup on Windows; no-op on POSIX
+    ignore_sigpipe();                // a client disconnecting mid-stream must not kill us (POSIX)
     int port=8765;
+    // Idle timeout applied to each accepted socket, both directions. 0 disables
+    // it (the old, wedge-prone behaviour) if a client ever needs to hold a
+    // connection open silently.
+    //
+    // 15s is chosen against two bounds. Lower: every client sends its one short
+    // JSON line immediately after connecting, so any real request is well under
+    // a second. Upper: a stalled peer blocks the serial accept loop until it is
+    // reaped, so this is also the worst-case delay it can inflict on the next
+    // client — and it must stay below f2k_watchdog.sh's 20s probe timeout, or a
+    // stall being reaped normally would cost the watchdog a spurious strike.
+    int io_timeout=15;
     for(int i=1;i<argc;++i){ std::string a=argv[i];
-        if(a=="--port"&&i+1<argc) port=std::atoi(argv[++i]); }
+        if(a=="--port"&&i+1<argc) port=std::atoi(argv[++i]);
+        else if(a=="--io-timeout"&&i+1<argc) io_timeout=std::atoi(argv[++i]);
+        else if(a=="--transformer"&&i+1<argc) g_tf_default=argv[++i];
+        else if(a=="--model"&&i+1<argc) g_model_default=argv[++i]; }
+    // Bind FIRST, before the ~12s model load: a port clash should fail fast and
+    // not waste 12s + ~14GB of VRAM. (A stale serve.exe still holding the port is
+    // the usual cause — note SO_REUSEADDR won't override an actively-bound port.)
+    sock_t srv=socket(AF_INET,SOCK_STREAM,0); int yes=1;
+    setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const char*>(&yes),sizeof(yes));
+    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(port);
+    addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);   // 127.0.0.1 only
+    if(bind(srv,(sockaddr*)&addr,sizeof(addr))<0){
+#ifdef _WIN32
+        // Winsock doesn't set errno, so perror() prints a useless "No error".
+        std::fprintf(stderr,"[worker] bind failed on port %d: WSA error %d"
+            " (10048 = port already in use; kill the stale serve.exe)\n", port, WSAGetLastError());
+#else
+        std::fprintf(stderr,"[worker] bind failed on port %d: %s\n", port, std::strerror(errno));
+#endif
+        return 1;
+    }
+    listen(srv,4);
+
     Worker w; std::string err;
     std::fprintf(stderr,"[worker] loading resident models...\n");
     if(!w.init(err)){ std::fprintf(stderr,"[worker] init failed: %s\n",err.c_str()); return 1; }
-
-    int srv=socket(AF_INET,SOCK_STREAM,0); int yes=1;
-    setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
-    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(port);
-    addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);   // 127.0.0.1 only
-    if(bind(srv,(sockaddr*)&addr,sizeof(addr))<0){ perror("bind"); return 1; }
-    listen(srv,4);
     std::fprintf(stderr,"[worker] ready, listening on 127.0.0.1:%d\n",port);
     while(true){
-        int fd=accept(srv,nullptr,nullptr); if(fd<0) continue;
+        sock_t fd=accept(srv,nullptr,nullptr); if(!sock_valid(fd)) continue;
+        if(io_timeout>0) set_io_timeouts(fd,io_timeout);
         std::string line; json resp;
+        // A stalled peer is dropped rather than answered: replying would just
+        // block again (bounded by SO_SNDTIMEO, but pointlessly). Closing frees
+        // the accept loop for everyone else, which is the entire point.
+        const LineStatus st=read_line(fd,line);
+        if(st==LineStatus::TimedOut){
+            std::fprintf(stderr,"[worker] client stalled mid-request; dropped after %ds\n",io_timeout);
+            sock_close(fd); continue;
+        }
         // emit writes one '\n'-delimited JSON line (progress events) to the client.
-        auto emit=[&](const json& j){ std::string s=j.dump()+"\n"; (void)!write(fd,s.data(),s.size()); };
-        if(read_line(fd,line)){
+        // Once a write fails (dead or wedged reader) stop emitting: with
+        // SO_SNDTIMEO each further event would otherwise burn the full timeout,
+        // turning one gone client into minutes of stalled generation.
+        bool client_gone=false;
+        auto emit=[&](const json& j){
+            if(client_gone) return;
+            std::string s=j.dump()+"\n";
+            if(!send_all(fd,s.data(),s.size())) client_gone=true;
+        };
+        if(st==LineStatus::Ok){
             try { resp=w.generate(json::parse(line), emit); }
             catch(const std::exception& e){ resp=json{{"ok",false},{"error",std::string("parse/exec: ")+e.what()}}; }
         } else resp=json{{"ok",false},{"error","empty request"}};
-        std::string out=resp.dump()+"\n"; (void)!write(fd,out.data(),out.size()); close(fd);
+        std::string out=resp.dump()+"\n"; (void)!send_all(fd,out.data(),out.size()); sock_close(fd);
         if(resp.value("ok",false)) std::fprintf(stderr,"[worker] job ok %.1fs\n",resp.value("elapsed",0.0));
         else std::fprintf(stderr,"[worker] job ERR: %s\n",resp.value("error","").c_str());
     }

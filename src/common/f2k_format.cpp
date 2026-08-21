@@ -1,57 +1,29 @@
 #include "common/f2k_format.h"
 
-#include <cerrno>
+#include <cstdio>
 #include <cstring>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace f2k {
 
 // ---------- helpers ----------
+// Portable stdio I/O (FILE*): builds on POSIX and Windows alike.
 
-static bool write_all(int fd, const void* p, size_t n) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    while (n) {
-        ssize_t w = ::write(fd, b, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        b += w;
-        n -= static_cast<size_t>(w);
-    }
-    return true;
-}
-
-static bool pwrite_all(int fd, const void* p, size_t n, off_t off) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    while (n) {
-        ssize_t w = ::pwrite(fd, b, n, off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        b += w;
-        n -= static_cast<size_t>(w);
-        off += w;
-    }
-    return true;
+static bool write_all(std::FILE* f, const void* p, size_t n) {
+    return n == 0 || std::fwrite(p, 1, n, f) == n;
 }
 
 // ---------- writer ----------
 
 F2KWriter::F2KWriter(const std::string& path) : path_(path) {
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd_ < 0) {
+    f_ = std::fopen(path.c_str(), "wb");   // write + truncate, binary, seekable
+    if (!f_) {
         ok_ = false;
-        last_error_ = "open(): " + std::string(std::strerror(errno));
+        last_error_ = "fopen(): " + path;
         return;
     }
-    // Reserve the header; we'll patch it in commit().
+    // Reserve the header; we'll patch it in commit() via fseek(0).
     FileHeader hdr{};
-    if (!write_all(fd_, &hdr, sizeof(hdr))) {
+    if (!write_all(f_, &hdr, sizeof(hdr))) {
         ok_ = false;
         last_error_ = "write(header reservation)";
         return;
@@ -60,7 +32,7 @@ F2KWriter::F2KWriter(const std::string& path) : path_(path) {
 }
 
 F2KWriter::~F2KWriter() {
-    if (fd_ >= 0) ::close(fd_);
+    if (f_) std::fclose(f_);
 }
 
 bool F2KWriter::pad_to_align(size_t align) {
@@ -71,7 +43,7 @@ bool F2KWriter::pad_to_align(size_t align) {
     uint64_t left = pad;
     while (left) {
         const size_t chunk = (left > sizeof(z)) ? sizeof(z) : static_cast<size_t>(left);
-        if (!write_all(fd_, z, chunk)) return false;
+        if (!write_all(f_, z, chunk)) return false;
         left -= chunk;
     }
     cursor_ += pad;
@@ -104,7 +76,7 @@ bool F2KWriter::add_tensor(const std::string& name,
 
     p.data_offset = cursor_;
     p.data_size   = blob_size;
-    if (blob_size > 0 && !write_all(fd_, blob, blob_size)) {
+    if (blob_size > 0 && !write_all(f_, blob, blob_size)) {
         ok_ = false;
         last_error_ = "write(blob)";
         return false;
@@ -119,7 +91,7 @@ bool F2KWriter::add_tensor(const std::string& name,
         }
         p.scales_offset = cursor_;
         p.scales_size   = scales_size;
-        if (!write_all(fd_, scales, scales_size)) {
+        if (!write_all(f_, scales, scales_size)) {
             ok_ = false;
             last_error_ = "write(scales)";
             return false;
@@ -167,7 +139,7 @@ bool F2KWriter::commit() {
         for (int64_t d : p.shape) put(&d, sizeof(d));
         put(p.name.data(), p.name.size());
     }
-    if (!write_all(fd_, manifest.data(), manifest.size())) {
+    if (!write_all(f_, manifest.data(), manifest.size())) {
         ok_ = false;
         last_error_ = "write(manifest)";
         return false;
@@ -181,14 +153,15 @@ bool F2KWriter::commit() {
     hdr.data_offset         = sizeof(FileHeader);
     hdr.data_size_bytes     = data_size;
     hdr.total_tensors       = pending_.size();
-    if (!pwrite_all(fd_, &hdr, sizeof(hdr), 0)) {
+    // Patch the header at offset 0 (reserved in the ctor), then flush.
+    if (std::fseek(f_, 0, SEEK_SET) != 0 || !write_all(f_, &hdr, sizeof(hdr))) {
         ok_ = false;
-        last_error_ = "pwrite(header)";
+        last_error_ = "write(header patch)";
         return false;
     }
-    if (::fsync(fd_) != 0) {
+    if (std::fflush(f_) != 0) {
         ok_ = false;
-        last_error_ = "fsync()";
+        last_error_ = "fflush()";
         return false;
     }
     sealed_ = true;
@@ -201,14 +174,8 @@ F2KReader::F2KReader()  = default;
 F2KReader::~F2KReader() { close(); }
 
 void F2KReader::close() {
-    if (mapped_) {
-        ::munmap(mapped_, file_size_);
-        mapped_ = nullptr;
-    }
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
-    }
+    f2k::platform::unmap(map_);
+    mapped_ = nullptr;
     file_size_ = 0;
     order_.clear();
     tensors_.clear();
@@ -217,25 +184,13 @@ void F2KReader::close() {
 
 bool F2KReader::open(const std::string& path) {
     close();
-    fd_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) {
-        last_error_ = "open(): " + std::string(std::strerror(errno));
+    if (!f2k::platform::map_readonly(path, map_, last_error_)) {
         return false;
     }
-    struct stat st;
-    if (::fstat(fd_, &st) != 0) {
-        last_error_ = "fstat()";
-        return false;
-    }
-    file_size_ = static_cast<size_t>(st.st_size);
+    mapped_ = map_.data;
+    file_size_ = map_.size;
     if (file_size_ < sizeof(FileHeader)) {
         last_error_ = "file shorter than header";
-        return false;
-    }
-    mapped_ = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (mapped_ == MAP_FAILED) {
-        last_error_ = "mmap(): " + std::string(std::strerror(errno));
-        mapped_ = nullptr;
         return false;
     }
     const uint8_t* base = static_cast<const uint8_t*>(mapped_);

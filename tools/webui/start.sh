@@ -8,9 +8,13 @@ set -e
 cd "$(dirname "$0")/../.."   # repo root
 
 PORT="${F2K_WORKER_PORT:-8765}"
+# Preload the default model's encoder at boot (web UI defaults to klein-4B).
+DEFAULT_MODEL_DIR="$HOME/models/${F2K_DEFAULT_MODEL:-flux2-klein-4B}"
+MODEL_ARGS=()
+[ -d "$DEFAULT_MODEL_DIR/qwen3_f2k" ] && MODEL_ARGS=(--model "$DEFAULT_MODEL_DIR")
 if ! pgrep -f "build/serve --port $PORT" >/dev/null 2>&1; then
     echo "[start] launching persistent worker (resident model load ~12s)..."
-    ./build/serve --port "$PORT" >/tmp/f2k_serve.log 2>&1 &
+    ./build/serve --port "$PORT" "${MODEL_ARGS[@]}" >/tmp/f2k_serve.log 2>&1 &
     # wait until it's listening (so the first request hits the fast path)
     for _ in $(seq 1 40); do grep -q "ready, listening" /tmp/f2k_serve.log 2>/dev/null && break; sleep 1; done
     echo "[start] worker: $(tail -1 /tmp/f2k_serve.log)"

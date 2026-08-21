@@ -48,6 +48,10 @@ outputs/
 .venv/
 .claude/
 
+# Python bytecode (tools/webui/, tools/training/, anywhere else it runs)
+__pycache__/
+*.py[cod]
+
 # Web UI runtime outputs (generated images + run metadata)
 tools/webui/runs/
 

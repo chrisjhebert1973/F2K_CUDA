@@ -1,0 +1,52 @@
+diff --git a/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp b/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
+index c15c472..853f050 100644
+--- a/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
++++ b/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
+@@ -241,7 +241,7 @@ public:
+   };
+ 
+   // Device side epilogue params
+-  struct Params {
++  struct alignas(64) Params {   // alignas(64): SM120 TMA tensormap needs 64B align (CUTLASS #2906)
+     using TMA_C = decltype(make_tma_copy(
+         CopyOpG2S{},
+         make_tensor(make_gmem_ptr<TmaElementC const>(nullptr),
+@@ -258,8 +258,8 @@ public:
+         _1{}));
+ 
+     typename FusionCallbacks::Params thread{};
+-    TMA_C tma_load_c;
+-    TMA_D tma_store_d;
++    alignas(64) TMA_C tma_load_c;
++    alignas(64) TMA_D tma_store_d;
+     uint32_t tma_transaction_bytes = TmaTransactionBytes;
+   };
+ 
+diff --git a/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp b/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp
+index 6a8f9ec..2ea26b6 100755
+--- a/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp
++++ b/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp
+@@ -290,7 +290,7 @@ struct CollectiveMma<
+   };
+ 
+   // Device side kernel params
+-  struct Params {
++  struct alignas(64) Params {   // alignas(64): SM120 TMA tensormap needs 64B align (CUTLASS #2906)
+     // Assumption: StrideA is congruent with Problem_MK
+     using TMA_A = decltype(make_tma_copy(
+         GmemTiledCopyA{},
+@@ -321,10 +321,10 @@ struct CollectiveMma<
+         make_shape(shape<1>(TileShapeSFB{}), shape<2>(TileShapeSFB{})),
+         _1{}));  // No programmatic multicast
+ 
+-    TMA_A tma_load_a;
+-    TMA_B tma_load_b;
+-    TMA_SFA tma_load_sfa;
+-    TMA_SFB tma_load_sfb;
++    alignas(64) TMA_A tma_load_a;
++    alignas(64) TMA_B tma_load_b;
++    alignas(64) TMA_SFA tma_load_sfa;
++    alignas(64) TMA_SFB tma_load_sfb;
+     LayoutSFA layout_SFA;
+     LayoutSFB layout_SFB;
+     uint32_t tma_transaction_bytes = TmaTransactionBytes;

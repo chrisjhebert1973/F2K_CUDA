@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "common/platform.h"
 
 #include <optional>
 #include <string>
@@ -35,9 +36,9 @@ public:
 private:
     void close();
 
-    int                 fd_        = -1;
-    void*               mapped_    = nullptr;
-    size_t              file_size_ = 0;
+    f2k::platform::FileMapping map_{};            // owns the OS mapping
+    void*               mapped_    = nullptr;     // = map_.data
+    size_t              file_size_ = 0;           // = map_.size
     std::vector<std::string>                       order_;
     std::unordered_map<std::string, TensorView>    tensors_;
     std::unordered_map<std::string, std::string>   metadata_;
