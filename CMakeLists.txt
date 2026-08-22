@@ -362,6 +362,17 @@ if(F2K_ENABLE_CUDA)
     add_executable(octane_bridge tools/octane_bridge.cpp)
     target_link_libraries(octane_bridge PRIVATE stb nlohmann_json)
 
+    # The bridge wire format has an out-of-tree consumer (the LLM server on
+    # spark-65c1 drives GEN as a tool), so the framing is a published API that
+    # cannot be found by grepping this repo. This test pins it. It spawns its own
+    # bridge on a free port with a dead worker port, so it needs no GPU, no model
+    # and never touches the running service.
+    add_executable(test_bridge_protocol tests/test_bridge_protocol.cpp)
+    target_compile_definitions(test_bridge_protocol PRIVATE
+        OCTANE_BRIDGE_BIN="$<TARGET_FILE:octane_bridge>")
+    add_dependencies(test_bridge_protocol octane_bridge)
+    add_test(NAME bridge_protocol COMMAND test_bridge_protocol)
+
     add_executable(bench_attention tools/bench_attention.cu)
     target_link_libraries(bench_attention PRIVATE f2k_cuda)
 
