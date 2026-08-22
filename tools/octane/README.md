@@ -40,6 +40,11 @@ Bridge options:
 | `--model` | *(none = stock 9B)* | model name under `~/models`, or an absolute root, e.g. `flux2-klein-4B` |
 | `--precision` | `fp8` | `fp8` or `nvfp4` |
 
+> **Wire protocol:** [PROTOCOL.md](PROTOCOL.md) is the canonical contract — verbs,
+> framing, which `CAPS` values to adopt and which are bridge policy, and what is
+> frozen. It has an out-of-tree consumer (the LLM server on spark-65c1), so read
+> it before changing anything on the wire. `ctest -R bridge_protocol` enforces it.
+
 `octane_bridge` builds with the rest of the project (`cmake --build build --target
 octane_bridge`) or standalone:
 
