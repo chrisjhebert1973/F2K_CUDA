@@ -140,6 +140,27 @@ the `clamped:` / `model:` phases. None moved an existing field or added a frame
 type. If the wire format ever has to change incompatibly, the F2K side owns
 telling the consumers first.
 
+## Checking a mirror
+
+Consumers may keep a local copy of this file (LLMTest does, at
+`docs/F2K_BRIDGE_CONTRACT.md` on spark-65c1, under a header naming this file and
+the commit it was taken at). A mirror is one-directional: re-copy it, never edit
+it. An edited mirror is the worst case -- it looks synced and is not.
+
+To check one, anchor on the content's first heading rather than a line count:
+
+    diff <(sed -n '/^# octane_bridge/,$p' <mirror>) tools/octane/PROTOCOL.md
+
+Not `tail -n +N`. That hardcodes the current header length, so the day a mirror
+is re-taken under a longer header the check fails on content that is byte-identical
+-- and a check that cries wolf once teaches the reader to ignore the one signal
+that would have caught real drift. (This is not hypothetical: the `tail` form was
+written here first, and failed exactly that way when tested.)
+
+The anchor does depend on this file's title line staying `# octane_bridge`. That
+is a far less likely edit than the header changing, but if you rename it, fix this
+section in the same commit.
+
 ## Operational notes
 
 * `f2k-worker`, `f2k-octane-bridge` and `f2k-web` are systemd units and come back
