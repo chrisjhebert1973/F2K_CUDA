@@ -3,6 +3,17 @@
 The producer side's statement of what `tools/octane_bridge.cpp` guarantees. This
 file is canonical; if it contradicts the code, the code wins and this is the bug.
 
+**Where this file lives**, for anyone writing a mirror header or following one:
+
+    on spark-f42d   /home/chris/Documents/Development/Cpp/Projects/F2KTest/tools/octane/PROTOCOL.md
+    on GitHub       chrisjhebert1973/F2K_CUDA -> tools/octane/PROTOCOL.md
+
+Quote it rooted or as the GitHub path. A bare `F2KTest/...` reads as `~/F2KTest`,
+which does not exist -- a mirror header carrying that sends its reader nowhere,
+which is worse than a stale mirror, because a stale mirror at least announces
+itself. (Not hypothetical: the first mirror header said exactly that, and the
+consumer had to fetch from GitHub to re-take it.)
+
 Two consumers depend on it today:
 
 * `tools/octane/roadrunner.cxx` — the SGI Octane client, in this repo.
