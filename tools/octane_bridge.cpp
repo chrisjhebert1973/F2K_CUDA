@@ -476,6 +476,21 @@ void handle_client(int fd) {
     // Report those adjustments before the batch starts. PROGRESS already carries
     // a free-text phase, so this needs no new message type and no framing change:
     // a client that ignores phase text sees exactly what it saw before.
+    //
+    // BEFORE YOU DELETE THIS as dead code: it is expected to be silent, and that
+    // is not evidence it is dead. The LLM server on spark-65c1 queries CAPS and
+    // pre-corrects every value below before it sends, so through that client this
+    // block can only fire when its view of the limits and ours have diverged --
+    // which is exactly when someone needs to hear about it. Silence here is the
+    // system working, not the code being unused. (The Octane client does not
+    // pre-correct, so a human typing 640 into it still trips this.)
+    //
+    // What would actually justify removing it: a passing `ctest -R bridge_protocol`
+    // AND no `[bridge] clamped:` lines in journalctl -u f2k-octane-bridge across
+    // real use. The test proves the path still works; the log proves whether
+    // anything still drives it. Neither substitutes for the other -- green tests
+    // survive the call site being deleted, and an empty log cannot tell a dead
+    // path from a broken one. See tools/octane/PROTOCOL.md.
     std::string clamped;
     auto note = [&clamped](const char* what, int from, int to) {
         if (from == to) return;

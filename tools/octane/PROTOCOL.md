@@ -9,7 +9,7 @@ file is canonical; if it contradicts the code, the code wins and this is the bug
     on GitHub       chrisjhebert1973/F2K_CUDA -> tools/octane/PROTOCOL.md
 
 Quote it rooted or as the GitHub path. A bare `F2KTest/...` reads as `~/F2KTest`,
-which does not exist -- a mirror header carrying that sends its reader nowhere,
+which does not exist — a mirror header carrying that sends its reader nowhere,
 which is worse than a stale mirror, because a stale mirror at least announces
 itself. (Not hypothetical: the first mirror header said exactly that, and the
 consumer had to fetch from GitHub to re-take it.)
@@ -156,7 +156,7 @@ telling the consumers first.
 Consumers may keep a local copy of this file (LLMTest does, at
 `docs/F2K_BRIDGE_CONTRACT.md` on spark-65c1, under a header naming this file and
 the commit it was taken at). A mirror is one-directional: re-copy it, never edit
-it. An edited mirror is the worst case -- it looks synced and is not.
+it. An edited mirror is the worst case — it looks synced and is not.
 
 To check one, anchor on the content's first heading rather than a line count:
 
@@ -164,7 +164,7 @@ To check one, anchor on the content's first heading rather than a line count:
 
 Not `tail -n +N`. That hardcodes the current header length, so the day a mirror
 is re-taken under a longer header the check fails on content that is byte-identical
--- and a check that cries wolf once teaches the reader to ignore the one signal
+— and a check that cries wolf once teaches the reader to ignore the one signal
 that would have caught real drift. (This is not hypothetical: the `tail` form was
 written here first, and failed exactly that way when tested.)
 
